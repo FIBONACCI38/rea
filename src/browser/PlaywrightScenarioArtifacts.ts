@@ -5,13 +5,14 @@ import type { BrowserContext, Page } from "playwright-core";
 
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import {
+  BROWSER_STORAGE_FINGERPRINT_VERSION,
   browserStepArtifactsSchema,
   type BrowserStepArtifacts,
-} from "../domain/browserScenarioCapture.js";
+} from "../domain/browserScenarioCaptureValues.js";
 import type { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
 
 const historyValueSchema = z.strictObject({
-  length: z.number().int().min(0),
+  length: z.int().min(0),
   navigation_entries: z.array(
     z.strictObject({
       type: z.string(),
@@ -42,7 +43,14 @@ const textArtifact = (text: string) => {
   };
 };
 
-const captureScreenshot = async (page: Page) => {
+const SCREENSHOT_PRIVACY_REASON =
+  "Screenshot withheld because this scenario may display explicitly sensitive values; safe pixel redaction is unavailable.";
+
+const captureScreenshot = async (
+  page: Page,
+  secrets: BrowserScenarioSecrets,
+) => {
+  if (secrets.withholdsScreenshots()) return missing(SCREENSHOT_PRIVACY_REASON);
   try {
     const bytes = await page.screenshot({
       type: "png",
@@ -154,21 +162,22 @@ const captureStorage = async (input: {
       }))()`),
     );
     const value = {
+      fingerprint_version: BROWSER_STORAGE_FINGERPRINT_VERSION,
       cookies: cookies.map((cookie) => ({
-        name: cookie.name,
-        domain: cookie.domain,
-        path: cookie.path,
+        name: secrets.redact(cookie.name),
+        domain: secrets.redact(cookie.domain),
+        path: secrets.redact(cookie.path),
         secure: cookie.secure,
         http_only: cookie.httpOnly,
         same_site: cookie.sameSite,
         ...secrets.fingerprint(cookie.value),
       })),
       local_storage: pageStorage.local_storage.map(([name, value]) => ({
-        name,
+        name: secrets.redact(name),
         ...secrets.fingerprint(value),
       })),
       session_storage: pageStorage.session_storage.map(([name, value]) => ({
-        name,
+        name: secrets.redact(name),
         ...secrets.fingerprint(value),
       })),
     };
@@ -194,7 +203,9 @@ export const capturePlaywrightStepArtifacts = async (input: {
     Value | ReturnType<typeof notRequested> | ReturnType<typeof missing>
   > => (!requested.has(kind) ? Promise.resolve(notRequested()) : capture());
   return browserStepArtifactsSchema.parse({
-    screenshot: await state("screenshot", () => captureScreenshot(page)),
+    screenshot: await state("screenshot", () =>
+      captureScreenshot(page, secrets),
+    ),
     dom: await state("dom", () => captureDom({ page, secrets })),
     accessibility: await state("accessibility", () =>
       captureAccessibility({ page, secrets }),

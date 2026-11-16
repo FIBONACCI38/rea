@@ -1,15 +1,19 @@
-import type { JsonValue } from "./jsonValue.js";
-import { AnalysisError } from "./analysisErrorBase.js";
+import {
+  AnalysisError,
+  type AnalysisErrorOptions,
+} from "./analysisErrorBase.js";
 
 /** A provider adapter failed outside its more precise typed variants. */
-export interface ProviderAdapterErrorOptions extends ErrorOptions {
-  readonly diagnostics?: Readonly<Record<string, JsonValue>>;
+export interface ProviderAdapterErrorOptions extends AnalysisErrorOptions {
+  readonly userMessage?: string;
+  readonly remediationAction?: string;
 }
 
 /** A provider adapter failed outside its more precise typed variants. */
 export class ProviderAdapterError extends AnalysisError {
   readonly _tag = "ProviderAdapterError";
-  readonly diagnostics: Readonly<Record<string, JsonValue>> | undefined;
+  override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
 
   constructor(
     readonly providerId: string,
@@ -17,9 +21,7 @@ export class ProviderAdapterError extends AnalysisError {
     options: ProviderAdapterErrorOptions = {},
   ) {
     super(`Provider ${providerId} adapter failed during ${operation}`, options);
-    this.diagnostics =
-      options.diagnostics === undefined
-        ? undefined
-        : structuredClone(options.diagnostics);
+    this.userMessage = options.userMessage;
+    this.remediationAction = options.remediationAction;
   }
 }

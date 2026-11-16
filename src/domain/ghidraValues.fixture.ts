@@ -6,7 +6,7 @@ export const ghidraFunctionClassification = () => ({
 });
 
 /** Wire-boundary fixture, not evidence that a real Ghidra run was performed. */
-export const ghidraFunctionBody = () => ({
+const ghidraFunctionBody = () => ({
   available: true as const,
   provenance: "ghidra-function-body-address-set",
   ranges: [{ start: "0x401000", end: "0x401005" }],
@@ -19,6 +19,13 @@ export const ghidraFunctionBody = () => ({
 export const ghidraFunctionIdentity = () => ({
   address: "0x401000",
   name: "fixture_main",
+  symbol: {
+    primary: true,
+    dynamic: false,
+    external: false,
+    type: "function",
+    source: "imported" as const,
+  },
   classification: ghidraFunctionClassification(),
   body: ghidraFunctionBody(),
 });
@@ -147,7 +154,7 @@ export const ghidraNativeApiBoundary = () => ({
   ],
 });
 
-export const ghidraFunctionDossier = (includeAssembly = true): JsonValue => {
+export const ghidraFunctionDossier = (): JsonValue => {
   const pseudocode = "int fixture_main(void) { return 42; }";
   return {
     procedure: {
@@ -156,10 +163,18 @@ export const ghidraFunctionDossier = (includeAssembly = true): JsonValue => {
       locals: [],
     },
     pseudocode,
-    assembly: includeAssembly
-      ? ["0x401000: CALL 0x401020", "0x401005: RET"]
-      : [],
+    assembly: ["0x401000: CALL 0x401020", "0x401005: RET"],
     comments: [],
+    facet_availability: {
+      pseudocode: { available: true },
+      assembly: { available: true },
+      comments: { available: true },
+      callers: { available: true },
+      callees: { available: true },
+      references: { available: true },
+      strings_names: { available: true },
+      cfg: { available: true },
+    },
     callers: [],
     callees: [],
     incoming_references: [],
@@ -184,6 +199,7 @@ export const ghidraFunctionDossier = (includeAssembly = true): JsonValue => {
           sequence: 0,
           opcode: "COPY",
           is_dead: false,
+          block_membership: "member",
           inputs: [
             {
               kind: "constant",
@@ -201,6 +217,8 @@ export const ghidraFunctionDossier = (includeAssembly = true): JsonValue => {
         },
       ],
       def_use: [],
+      parameters: [],
+      parameter_uses: [],
       effects: [],
       truncated: false,
       omitted_operations_lower_bound: 0,

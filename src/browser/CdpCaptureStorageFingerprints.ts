@@ -2,11 +2,10 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
-import { compareCodePoints } from "../domain/canonicalOrdering.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
+import { decodePaddedBase64 } from "../domain/paddedBase64.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { CdpConnection } from "./CdpConnection.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
 import {
@@ -21,14 +20,14 @@ type StorageFingerprint =
 export interface CapturedStorageItems {
   readonly items: readonly {
     readonly key: string;
-    readonly value: string;
+    readonly value: string | undefined;
   }[];
   readonly complete: boolean;
 }
 
 export interface CapturedCache {
   readonly name: string;
-  readonly id: string;
+  readonly id: string | undefined;
 }
 
 interface StorageFingerprintContext {
@@ -87,7 +86,7 @@ export const captureStorageFingerprints = async ({
   await addIndexedDb(run, origin, indexedDbNames);
   await addCaches(run, caches);
   state.items.sort((left, right) =>
-    compareCodePoints(
+    compareUnicodeCodePoints(
       `${left.scope}:${left.identity_sha256}`,
       `${right.scope}:${right.identity_sha256}`,
     ),
@@ -107,7 +106,7 @@ const addStorageItems = (
       scope,
       identity: item.key,
       value: item.value,
-      complete: true,
+      complete: item.value !== undefined,
     });
 };
 
@@ -140,15 +139,15 @@ const addCookies = async (
     const value = cdpStringValue(cookie.value);
     const domain = cdpStringValue(cookie.domain);
     const path = cdpStringValue(cookie.path);
-    if (
-      name === undefined ||
-      value === undefined ||
-      domain === undefined ||
-      path === undefined
-    ) {
+    if (name === undefined || domain === undefined || path === undefined) {
       run.state.complete = false;
       continue;
     }
+    // CDP Cookie.partitionKeyOpaque means the partition exists but is not
+    // serializable. A missing partitionKey means unpartitioned, so hashing
+    // that absence would align an unresolved partition with a different cookie.
+    // https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-Cookie
+    const partitionOpaque = cookie.partitionKeyOpaque === true;
     addFingerprint(run.state, {
       scope: "cookie",
       identity: {
@@ -156,9 +155,10 @@ const addCookies = async (
         path,
         name,
         partition_key: cookie.partitionKey ?? null,
+        ...(partitionOpaque ? { partition_opaque: true } : {}),
       },
       value,
-      complete: true,
+      complete: value !== undefined && !partitionOpaque,
     });
   }
 };
@@ -191,11 +191,30 @@ const addIndexedDb = async (
     const stores = recordsValue(database.objectStores);
     if (stores.length !== database.objectStores.length)
       run.state.complete = false;
+    const version =
+      typeof database.version === "number" &&
+      Number.isSafeInteger(database.version) &&
+      database.version >= 0
+        ? database.version
+        : undefined;
+    if (version === undefined) {
+      const limitation =
+        "An IndexedDB schema fingerprint is incomplete because its database version is unavailable, invalid, or outside exact integer precision.";
+      if (!run.limitations.includes(limitation))
+        run.limitations.push(limitation);
+    }
     addFingerprint(run.state, {
       scope: "indexed_db_schema",
       identity: databaseName,
-      value: stores.map(indexedDbStoreSchema),
-      complete: indexedDbSchemaComplete(stores),
+      value: {
+        version: version ?? null,
+        object_stores: stores.map(indexedDbStoreSchema),
+      },
+      projectionVersion: 2,
+      complete:
+        version !== undefined &&
+        stores.length === database.objectStores.length &&
+        indexedDbSchemaComplete(stores),
     });
     for (const store of stores) {
       const objectStoreName = cdpStringValue(store.name);
@@ -230,18 +249,36 @@ const indexedDbSchemaComplete = (
   stores.every(
     (store) =>
       cdpStringValue(store.name) !== undefined &&
-      stableValueComplete(store.keyPath) &&
+      indexedDbKeyPathComplete(store.keyPath) &&
       typeof store.autoIncrement === "boolean" &&
       Array.isArray(store.indexes) &&
       recordsValue(store.indexes).length === store.indexes.length &&
       recordsValue(store.indexes).every(
         (index) =>
           cdpStringValue(index.name) !== undefined &&
-          stableValueComplete(index.keyPath) &&
+          indexedDbKeyPathComplete(index.keyPath) &&
           typeof index.unique === "boolean" &&
           typeof index.multiEntry === "boolean",
       ),
   );
+
+const indexedDbKeyPathComplete = (value: unknown): boolean => {
+  const keyPath = recordValue(value);
+  if (keyPath === undefined) return false;
+  switch (keyPath.type) {
+    case "null":
+      return true;
+    case "string":
+      return typeof keyPath.string === "string";
+    case "array":
+      return (
+        Array.isArray(keyPath.array) &&
+        keyPath.array.every((key) => typeof key === "string")
+      );
+    default:
+      return false;
+  }
+};
 
 const addIndexedDbRecords = async (
   run: FingerprintRun,
@@ -277,13 +314,14 @@ const addIndexedDbRecords = async (
       run.state.complete = false;
       return;
     }
+    const examinedCount = result.objectStoreDataEntries.length;
     const entries = recordsValue(result.objectStoreDataEntries);
     if (entries.length !== result.objectStoreDataEntries.length)
       run.state.complete = false;
     for (const entry of entries) {
-      const key = stableValue(entry.key);
-      const primaryKey = stableValue(entry.primaryKey);
-      const value = stableValue(entry.value);
+      const key = decodeRemoteObject(entry.key);
+      const primaryKey = decodeRemoteObject(entry.primaryKey);
+      const value = decodeRemoteObject(entry.value);
       addFingerprint(run.state, {
         scope: "indexed_db_record",
         identity: {
@@ -294,20 +332,18 @@ const addIndexedDbRecords = async (
         },
         value,
         complete:
-          remoteObjectComplete(entry.key) &&
-          remoteObjectComplete(entry.primaryKey) &&
-          remoteObjectComplete(entry.value),
+          key !== undefined && primaryKey !== undefined && value !== undefined,
       });
     }
     if (result.hasMore !== true) return;
     if (
-      entries.length === 0 ||
-      skipCount > Number.MAX_SAFE_INTEGER - entries.length
+      examinedCount === 0 ||
+      skipCount > Number.MAX_SAFE_INTEGER - examinedCount
     ) {
       run.state.complete = false;
       return;
     }
-    skipCount += entries.length;
+    skipCount += examinedCount;
   }
 };
 
@@ -316,6 +352,10 @@ const addCaches = async (
   caches: readonly CapturedCache[],
 ): Promise<void> => {
   for (const cache of caches) {
+    if (cache.id === undefined) {
+      run.state.complete = false;
+      continue;
+    }
     let skipCount = 0;
     let returnCount: number | undefined;
     while (returnCount === undefined || skipCount < returnCount) {
@@ -339,20 +379,21 @@ const addCaches = async (
         run.state.complete = false;
         break;
       }
+      const examinedCount = result.cacheDataEntries.length;
       const entries = recordsValue(result.cacheDataEntries);
       if (entries.length !== result.cacheDataEntries.length)
         run.state.complete = false;
       for (const entry of entries) await addCacheEntry(run, cache, entry);
       returnCount = result.returnCount;
-      if (skipCount + entries.length >= returnCount) break;
+      if (skipCount + examinedCount >= returnCount) break;
       if (
-        entries.length === 0 ||
-        skipCount > Number.MAX_SAFE_INTEGER - entries.length
+        examinedCount === 0 ||
+        skipCount > Number.MAX_SAFE_INTEGER - examinedCount
       ) {
         run.state.complete = false;
         break;
       }
-      skipCount += entries.length;
+      skipCount += examinedCount;
     }
   }
 };
@@ -392,13 +433,13 @@ const addCacheEntry = async (
     run.limitations,
   );
   const body = cdpStringValue(recordValue(recordValue(raw)?.response)?.body);
-  const decoded = body === undefined ? null : decodeBase64(body);
-  const complete = decoded !== null;
+  const decoded = body === undefined ? undefined : decodePaddedBase64(body);
+  const complete = decoded !== undefined;
   if (!complete) run.state.complete = false;
   addFingerprint(run.state, {
     scope: "cache_entry",
     identity: { cache: cache.name, requestURL, requestMethod, requestHeaders },
-    value: decoded ?? undefined,
+    value: decoded,
     complete,
   });
 };
@@ -410,12 +451,16 @@ const addFingerprint = (
     readonly identity: unknown;
     readonly value: unknown;
     readonly complete: boolean;
+    readonly projectionVersion?: 2;
   },
 ): void => {
   state.items.push({
     scope: input.scope,
     identity_sha256: digest(input.identity),
     value_sha256: input.value === undefined ? null : digest(input.value),
+    ...(input.projectionVersion === undefined
+      ? {}
+      : { projection_version: input.projectionVersion }),
     complete:
       input.complete &&
       stableValueComplete(input.identity) &&
@@ -448,8 +493,7 @@ const stableValue = (value: unknown): unknown => {
   if (record === undefined) return String(value);
   return Object.fromEntries(
     Object.entries(record)
-      .filter(([key]) => key !== "objectId" && key !== "customPreview")
-      .sort(([left], [right]) => compareCodePoints(left, right))
+      .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
       .map(([key, item]) => [key, stableValue(item)]),
   );
 };
@@ -468,31 +512,56 @@ const stableValueComplete = (value: unknown): boolean => {
     return value.every((item) => stableValueComplete(item));
   const record = recordValue(value);
   if (record === undefined) return false;
-  const entries = Object.entries(record).filter(
-    ([key]) => key !== "objectId" && key !== "customPreview",
-  );
+  const entries = Object.entries(record);
   return entries.every(([, item]) => stableValueComplete(item));
 };
 
-const remoteObjectComplete = (value: unknown): boolean => {
+/** Decode CDP value evidence once; debugger labels/references are not content.
+ * https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#type-RemoteObject
+ */
+const decodeRemoteObject = (value: unknown): unknown => {
   const record = recordValue(value);
-  if (record === undefined) return true;
-  return (
-    record.objectId === undefined &&
-    record.preview === undefined &&
-    record.customPreview === undefined &&
-    (record.type !== "object" || record.value !== undefined) &&
-    stableValueComplete(record)
-  );
-};
-
-const decodeBase64 = (value: string): Buffer | null => {
-  if (
-    value.length % 4 !== 0 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
-      value,
-    )
-  )
-    return null;
-  return Buffer.from(value, "base64");
+  if (record === undefined) return undefined;
+  const { type, unserializableValue } = record;
+  const serialized = record.value;
+  const primitive = (valid: boolean): unknown =>
+    valid ? { type, value: serialized } : undefined;
+  switch (type) {
+    case "undefined":
+      return serialized === undefined && unserializableValue === undefined
+        ? { type }
+        : undefined;
+    case "string":
+    case "boolean":
+      return primitive(
+        typeof serialized === type && unserializableValue === undefined,
+      );
+    case "number":
+      if (unserializableValue === undefined)
+        return primitive(
+          typeof serialized === "number" && Number.isFinite(serialized),
+        );
+      return serialized === undefined &&
+        typeof unserializableValue === "string" &&
+        ["-0", "NaN", "Infinity", "-Infinity"].includes(unserializableValue)
+        ? { type, unserializableValue }
+        : undefined;
+    case "bigint":
+      return serialized === undefined &&
+        typeof unserializableValue === "string" &&
+        /^-?\d+n$/u.test(unserializableValue)
+        ? { type, unserializableValue }
+        : undefined;
+    case "object":
+      return primitive(
+        unserializableValue === undefined &&
+          (record.subtype === "null"
+            ? serialized === null
+            : serialized !== null &&
+              typeof serialized === "object" &&
+              stableValueComplete(serialized)),
+      );
+    default:
+      return undefined;
+  }
 };

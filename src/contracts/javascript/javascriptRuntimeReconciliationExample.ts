@@ -2,11 +2,13 @@ import { createEvidence } from "../../domain/evidence.js";
 import {
   createJavaScriptApplicationGraph,
   createJavaScriptApplicationNode,
+  createJavaScriptApplicationEdge,
 } from "../../domain/javascript/javascriptApplicationGraph.js";
 import { createWebTextArtifact } from "../../domain/webContentArtifact.js";
 import {
   createJavaScriptSemanticGraph,
   createJavaScriptSemanticGraphNode,
+  JavaScriptSemanticEvidenceContextRegistry,
 } from "../../domain/javascript/javascriptSemanticGraph.js";
 import { JAVASCRIPT_SEMANTIC_RELATION_FAMILIES } from "../../domain/javascript/javascriptSemanticGraphSchemas.js";
 
@@ -62,33 +64,73 @@ const asset = createJavaScriptApplicationNode({
     },
   ],
 });
+const root = createJavaScriptApplicationNode({
+  kind: "artifact",
+  identity: {
+    strategy: "content-digest",
+    stability: "global-exact",
+    sha256: applicationSha256,
+  },
+  observations: [
+    {
+      label: "artifact root",
+      properties: { format: "directory" },
+      evidence: {
+        ...graphEvidence,
+        artifact: {
+          available: true,
+          artifact_id: `art_${applicationSha256}`,
+          sha256: applicationSha256,
+        },
+        location: {
+          available: true,
+          value: { kind: "artifact-path", path: "artifact-root" },
+        },
+        extractor: { ...graphEvidence.extractor, operation: "inventory-root" },
+      },
+    },
+  ],
+});
 const graph = createJavaScriptApplicationGraph({
   schema: "JavaScriptApplicationGraph",
-  root_node_ids: [asset.node_id],
-  nodes: [asset],
-  edges: [],
+  root_node_ids: [root.node_id],
+  nodes: [asset, root],
+  edges: [
+    createJavaScriptApplicationEdge({
+      source_node_id: root.node_id,
+      target_node_id: asset.node_id,
+      relation: "contains",
+      properties: { path: "renderer.js" },
+      evidence: graphEvidence,
+    }),
+  ],
   coverage: completeCoverage,
   limitations: [],
 });
-const semanticNode = createJavaScriptSemanticGraphNode({
-  kind: "module",
-  identity: {
-    artifact_sha256: applicationSha256,
-    module_path: "renderer.js",
-    source_range: null,
-    role_key: "example-module",
+const evidenceContexts = new JavaScriptSemanticEvidenceContextRegistry();
+const semanticNode = createJavaScriptSemanticGraphNode(
+  {
+    kind: "module",
+    identity: {
+      artifact_sha256: applicationSha256,
+      module_path: "renderer.js",
+      source_range: null,
+      role_key: "example-module",
+    },
+    function_node_id: null,
+    application_node_ids: [asset.node_id],
+    label: "renderer.js",
+    properties: {},
+    evidence: graphEvidence,
   },
-  function_node_id: null,
-  application_node_ids: [asset.node_id],
-  label: "renderer.js",
-  properties: {},
-  evidence: graphEvidence,
-});
+  evidenceContexts,
+);
 const semanticGraph = createJavaScriptSemanticGraph({
   schema: "JavaScriptSemanticRelationGraph",
   root_artifact_sha256: applicationSha256,
   application_graph_id: graph.graph_id,
   root_node_ids: [semanticNode.node_id],
+  evidence_contexts: evidenceContexts.contexts,
   nodes: [semanticNode],
   relations: [],
   fingerprints: [],
@@ -110,7 +152,8 @@ const semanticGraph = createJavaScriptSemanticGraph({
   limitations: ["Semantic relations are unavailable in this minimal example."],
 });
 
-const staticEvidence = createEvidence(
+/** Minimal valid static application Evidence for graph workflow examples. */
+export const JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE = createEvidence(
   { path: inputPath, sha256: applicationSha256, format: "directory" },
   {
     id: "rea-javascript-application",
@@ -127,6 +170,7 @@ const staticEvidence = createEvidence(
       root_artifact_sha256: applicationSha256,
       inventory_manifest_id: `agm_${"2".repeat(64)}`,
       inventory_graph_sha256: "3".repeat(64),
+      integrity_contradictions: [],
       graph,
       semantic_graph: semanticGraph,
       summary: {
@@ -151,6 +195,7 @@ const staticEvidence = createEvidence(
         resolved_utility_entrypoints: 0,
         native_addon_bindings: 0,
         resolved_native_addon_bindings: 0,
+        protocol_registrations: 0,
       },
       statistics: {
         relevant_files: 1,
@@ -158,11 +203,11 @@ const staticEvidence = createEvidence(
         text_bytes_read: script.bytes,
         invalid_utf8_files: 0,
         parsed_javascript_files: 1,
-        visited_ast_nodes: 1,
-        findings: 0,
+        skipped_javascript_files: 0,
+        visited_ast_nodes: 7,
+        findings: 1,
         modules: 0,
         parse_failures: 0,
-        truncated_scopes: 0,
       },
       limitations: [],
     },
@@ -170,9 +215,6 @@ const staticEvidence = createEvidence(
     authority: "shipped-artifact",
   },
 );
-
-/** Minimal valid static application Evidence for graph workflow examples. */
-export const JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE = staticEvidence;
 
 const runtimeEvidence = createEvidence(
   undefined,
@@ -238,7 +280,7 @@ const runtimeEvidence = createEvidence(
 
 /** Compact valid Evidence pair used by the public reconciliation contract. */
 export const JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE = {
-  static_layers: [{ analysis: staticEvidence }],
+  static_layers: [{ analysis: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE }],
   runtime_observations: [runtimeEvidence],
 };
 

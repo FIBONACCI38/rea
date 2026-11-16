@@ -1,6 +1,9 @@
 import { posix } from "node:path";
 
-import { compareCodePoints } from "../canonicalOrdering.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../unicodeCodePointOrder.js";
 import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
 import type { HistoricalSourceGraph } from "../referenceSourceGraph.js";
 import {
@@ -8,6 +11,10 @@ import {
   type SourceToBundleCandidate,
   type SourceToBundleSignal,
 } from "./sourceToBundleComparisonSchemas.js";
+import {
+  javaScriptFileOccurrenceSchema,
+  type JavaScriptFileOccurrence,
+} from "./javascriptArtifactFiles.js";
 import { isDigest } from "../digests.js";
 
 type SourceFile = Extract<
@@ -23,10 +30,14 @@ type CurrentPathKind =
 interface CurrentPath {
   readonly kind: CurrentPathKind;
   readonly value: string;
+  /** Artifact-relative map resolution identifies one path, not its suffixes. */
+  readonly allowSuffix: boolean;
 }
 
 interface CurrentProjection {
   readonly node: ApplicationNode;
+  readonly occurrence?: JavaScriptFileOccurrence;
+  readonly representations: readonly string[];
   readonly digests: ReadonlySet<string>;
   readonly paths: readonly CurrentPath[];
 }
@@ -40,6 +51,9 @@ export interface SourceToBundleCandidateIndex {
 }
 
 const RELEVANT_NODE_KINDS = new Set([
+  // Non-JavaScript source files such as JSON are projected as artifacts.
+  // Their content digests and paths still identify historical source files.
+  "artifact",
   "javascript-asset",
   "javascript-module",
   "source-module",
@@ -68,7 +82,9 @@ export const sourceBearingNodes = (
 ): ApplicationNode[] =>
   nodes
     .filter(({ kind }) => RELEVANT_NODE_KINDS.has(kind))
-    .sort((left, right) => compareCodePoints(left.node_id, right.node_id));
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.node_id, right.node_id),
+    );
 
 /** Keep historical source files in stable path order. */
 export const historicalSourceFiles = (
@@ -79,32 +95,38 @@ export const historicalSourceFiles = (
       (entry): entry is SourceFile =>
         entry.kind === "file" && entry.classifications.includes("source"),
     )
-    .sort((left, right) => compareCodePoints(left.path, right.path));
+    .sort((left, right) => compareUnicodeCodePoints(left.path, right.path));
 
 /** Build deterministic candidate indices without assigning fuzzy matches. */
 export const buildSourceToBundleCandidateIndex = (
   nodes: readonly ApplicationNode[],
 ): SourceToBundleCandidateIndex => {
-  const projections = nodes.map(projectCurrentNode);
+  const projections = projectCurrentOccurrences(nodes);
   const byDigest = new Map<string, Set<string>>();
   const byPathSuffix = new Map<string, Set<string>>();
   const byBasename = new Map<string, Set<string>>();
   for (const projection of projections) {
     for (const digest of projection.digests)
-      addIndexValue(byDigest, digest, projection.node.node_id);
+      addIndexValue(byDigest, digest, projectionKey(projection));
     for (const path of projection.paths) {
-      for (const suffix of pathSuffixes(path.value))
-        addIndexValue(byPathSuffix, suffix, projection.node.node_id);
+      for (const suffix of path.allowSuffix
+        ? pathSuffixes(path.value)
+        : [path.value]) {
+        addIndexValue(byPathSuffix, suffix, projectionKey(projection));
+        const canonical = suffix.normalize("NFC");
+        if (canonical !== suffix)
+          addIndexValue(byPathSuffix, canonical, projectionKey(projection));
+      }
       addIndexValue(
         byBasename,
         posix.basename(path.value),
-        projection.node.node_id,
+        projectionKey(projection),
       );
     }
   }
   return {
     nodes: new Map(
-      projections.map((projection) => [projection.node.node_id, projection]),
+      projections.map((projection) => [projectionKey(projection), projection]),
     ),
     byDigest,
     byPathSuffix,
@@ -117,16 +139,20 @@ export const candidateIdsForSource = (
   source: SourceFile,
   index: SourceToBundleCandidateIndex,
 ): string[] => {
+  const canonicalPath = source.path.normalize("NFC");
   const groups = [
     source.sha256 === null ? undefined : index.byDigest.get(source.sha256),
     index.byPathSuffix.get(source.path),
+    canonicalPath === source.path
+      ? undefined
+      : index.byPathSuffix.get(canonicalPath),
     index.byBasename.get(posix.basename(source.path)),
   ];
   const seen = new Set<string>();
   const output: string[] = [];
   for (const group of groups) {
     if (group === undefined) continue;
-    for (const nodeId of [...group].sort(compareCodePoints)) {
+    for (const nodeId of [...group].sort(compareUnicodeCodePoints)) {
       if (seen.has(nodeId)) continue;
       seen.add(nodeId);
       output.push(nodeId);
@@ -134,6 +160,14 @@ export const candidateIdsForSource = (
   }
   return output;
 };
+
+/** Whether an indexed candidate carries any content digest to compare. */
+export const candidateHasDigest = (
+  index: SourceToBundleCandidateIndex,
+  candidate: SourceToBundleCandidate,
+): boolean =>
+  (index.nodes.get(sourceToBundleCandidateIdentity(candidate))?.digests.size ??
+    0) > 0;
 
 /** Score one indexed candidate from explicit, caller-visible signals. */
 export const scoreSourceToBundleCandidate = (
@@ -147,12 +181,90 @@ export const scoreSourceToBundleCandidate = (
   const score = signals.reduce((total, signal) => total + signal.weight, 0);
   if (score < 20) return null;
   return {
+    ...(projection.occurrence === undefined
+      ? {}
+      : {
+          current_file_occurrence: projection.occurrence,
+          representation_node_ids: [...projection.representations],
+        }),
     current_node_id: projection.node.node_id,
     current_node_kind: projection.node.kind,
     score,
     confidence: candidateConfidence(signals),
     signals,
   };
+};
+
+const fileOccurrenceKey = (occurrence: JavaScriptFileOccurrence): string =>
+  compositeKey([
+    "file-occurrence",
+    occurrence.container_sha256,
+    occurrence.path,
+    occurrence.sha256,
+  ]);
+const projectionKey = (projection: CurrentProjection): string =>
+  projection.occurrence === undefined
+    ? projection.node.node_id
+    : fileOccurrenceKey(projection.occurrence);
+
+/** Matching and multiplicity share the producing occurrence identity. */
+export const sourceToBundleCandidateIdentity = (
+  candidate: SourceToBundleCandidate,
+): string =>
+  candidate.current_file_occurrence === undefined
+    ? candidate.current_node_id
+    : fileOccurrenceKey(candidate.current_file_occurrence);
+
+const projectCurrentOccurrences = (
+  nodes: readonly ApplicationNode[],
+): CurrentProjection[] => {
+  const groups = new Map<string, CurrentProjection>();
+  for (const node of nodes) {
+    const occurrences = new Map<
+      string,
+      {
+        occurrence: JavaScriptFileOccurrence;
+        observations: ApplicationNode["observations"][number][];
+      }
+    >();
+    for (const observation of node.observations) {
+      const parsed = javaScriptFileOccurrenceSchema.safeParse(
+        observation.properties.file_occurrence,
+      );
+      if (!parsed.success) continue;
+      const key = fileOccurrenceKey(parsed.data);
+      const previous = occurrences.get(key);
+      if (previous === undefined)
+        occurrences.set(key, {
+          occurrence: parsed.data,
+          observations: [observation],
+        });
+      else previous.observations.push(observation);
+    }
+    if (occurrences.size === 0) {
+      groups.set(node.node_id, projectCurrentNode(node));
+      continue;
+    }
+    for (const [key, { occurrence, observations }] of occurrences) {
+      const projected = projectCurrentNode({ ...node, observations });
+      const previous = groups.get(key);
+      groups.set(key, {
+        ...projected,
+        occurrence,
+        node: previous?.node ?? node,
+        representations: [
+          ...new Set([...(previous?.representations ?? []), node.node_id]),
+        ].sort(compareUnicodeCodePoints),
+        digests: new Set([
+          occurrence.sha256,
+          ...projected.digests,
+          ...(previous?.digests ?? []),
+        ]),
+        paths: uniquePaths([...projected.paths, ...(previous?.paths ?? [])]),
+      });
+    }
+  }
+  return [...groups.values()];
 };
 
 const projectCurrentNode = (node: ApplicationNode): CurrentProjection => {
@@ -163,19 +275,47 @@ const projectCurrentNode = (node: ApplicationNode): CurrentProjection => {
   if (node.identity.strategy === "source-map-original") {
     if (node.identity.source_sha256 !== null)
       digests.add(node.identity.source_sha256);
-    addPath(paths, "source-map-original", node.identity.original_source);
   }
   if (node.identity.strategy === "canonical-path")
-    addPath(paths, "canonical-path", node.identity.path);
+    addPath(paths, "canonical-path", node.identity.path, "artifact");
   for (const observation of node.observations) {
-    const sourceDigest = observation.properties.source_sha256;
-    if (typeof sourceDigest === "string" && isDigest(sourceDigest))
-      digests.add(sourceDigest);
-    for (const key of PATH_PROPERTIES)
-      addJsonPath(paths, observation.properties[key]);
+    if (node.identity.strategy === "source-map-original") {
+      const resolution = observation.source_map_reference?.resolution;
+      if (resolution !== undefined && resolution.kind !== "unresolved")
+        paths.push({
+          kind: "source-map-original",
+          value: resolution.path,
+          allowSuffix: resolution.kind === "suffix",
+        });
+    } else {
+      const sourceDigest = observation.properties.source_sha256;
+      if (typeof sourceDigest === "string" && isDigest(sourceDigest))
+        digests.add(sourceDigest);
+      for (const key of PATH_PROPERTIES) {
+        // A resolved declaration already has an owning artifact-path fact.
+        if (
+          key === "declared_path" &&
+          typeof observation.properties.resolved_path === "string"
+        )
+          continue;
+        addJsonPath(
+          paths,
+          observation.properties[key],
+          key === "resolved_path" ||
+            ((key === "path" || key === "module_path") &&
+              !(
+                typeof observation.properties[key] === "string" &&
+                SCHEME_URL.test(observation.properties[key])
+              ))
+            ? "artifact"
+            : "reference",
+        );
+      }
+    }
   }
   return {
     node,
+    representations: [node.node_id],
     digests,
     paths: uniquePaths(paths),
   };
@@ -196,6 +336,14 @@ const candidateSignals = (
     signals.push(
       signal("source-map-original-path", source.path, sourceMapPaths),
     );
+  const unicodeEquivalentPaths = matchingUnicodePaths(
+    source.path,
+    current.paths,
+  );
+  if (unicodeEquivalentPaths.length > 0)
+    signals.push(
+      signal("unicode-equivalent-path", source.path, unicodeEquivalentPaths),
+    );
   const otherPaths = current.paths.filter(
     ({ kind }) => kind !== "source-map-original",
   );
@@ -206,7 +354,10 @@ const candidateSignals = (
     signals.push(signal("current-path-exact", source.path, exactPaths));
   const suffixPaths = otherPaths
     .filter(
-      ({ value }) => value !== source.path && value.endsWith(`/${source.path}`),
+      ({ value, allowSuffix }) =>
+        allowSuffix &&
+        value !== source.path &&
+        value.endsWith(`/${source.path}`),
     )
     .map(({ value }) => value);
   if (suffixPaths.length > 0)
@@ -234,7 +385,7 @@ const signal = (
   kind,
   weight: signalWeight(kind),
   source_value: sourceValue,
-  current_values: [...new Set(currentValues)].sort(compareCodePoints),
+  current_values: [...new Set(currentValues)].sort(compareUnicodeCodePoints),
 });
 
 const candidateConfidence = (
@@ -253,50 +404,91 @@ const matchingPaths = (
 ): string[] =>
   currentPaths
     .filter(
-      ({ value }) => value === sourcePath || value.endsWith(`/${sourcePath}`),
+      ({ value, allowSuffix }) =>
+        value === sourcePath ||
+        (allowSuffix && value.endsWith(`/${sourcePath}`)),
     )
     .map(({ value }) => value);
 
-const addJsonPath = (paths: CurrentPath[], value: unknown): void => {
-  if (typeof value === "string") addPath(paths, "observation-path", value);
+const matchingUnicodePaths = (
+  sourcePath: string,
+  currentPaths: readonly CurrentPath[],
+): string[] => {
+  const canonicalSource = sourcePath.normalize("NFC");
+  return currentPaths
+    .filter(({ value, allowSuffix }) => {
+      if (
+        value === sourcePath ||
+        (allowSuffix && value.endsWith(`/${sourcePath}`))
+      )
+        return false;
+      const canonicalValue = value.normalize("NFC");
+      return (
+        canonicalValue === canonicalSource ||
+        (allowSuffix && canonicalValue.endsWith(`/${canonicalSource}`))
+      );
+    })
+    .map(({ value }) => value);
+};
+
+const addJsonPath = (
+  paths: CurrentPath[],
+  value: unknown,
+  format: "artifact" | "reference",
+): void => {
+  if (typeof value === "string")
+    addPath(paths, "observation-path", value, format);
 };
 
 const addPath = (
   paths: CurrentPath[],
   kind: CurrentPathKind,
   raw: string,
+  format: "artifact" | "reference",
 ): void => {
-  const value = normalizeCurrentPath(raw);
-  if (value !== null) paths.push({ kind, value });
+  const value = normalizeCurrentPath(raw, format);
+  if (value !== null) paths.push({ kind, value, allowSuffix: true });
 };
 
-/** Matches a `scheme://...` URL prefix; bare filesystem paths keep `?`/`#`. */
 const SCHEME_URL = /^[a-z][a-z0-9+.-]*:\/\//iu;
-/** Matches a `scheme://...` URL prefix with any run of slashes, for stripping. */
 const SCHEME_URL_PREFIX = /^[a-z][a-z0-9+.-]*:\/\/+/iu;
 
-const normalizeCurrentPath = (raw: string): string | null => {
-  const withoutQuery = SCHEME_URL.test(raw)
-    ? (raw.split(/[?#]/u, 1)[0] ?? "")
-    : raw;
-  const withoutScheme = withoutQuery.replace(SCHEME_URL_PREFIX, "");
-  const parts = withoutScheme
-    .replaceAll("\\", "/")
-    .split("/")
-    .filter((part) => part !== "" && part !== ".");
-  if (parts.length === 0 || parts.includes("..")) return null;
+const normalizeCurrentPath = (
+  raw: string,
+  format: "artifact" | "reference",
+): string | null => {
+  const withoutQuery =
+    format === "reference" && SCHEME_URL.test(raw)
+      ? (raw.split(/[?#]/u, 1)[0] ?? "")
+      : raw;
+  const portable =
+    format === "artifact"
+      ? withoutQuery
+      : withoutQuery.replace(SCHEME_URL_PREFIX, "").replaceAll("\\", "/");
+  const parts: string[] = [];
+  for (const part of portable.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else parts.push(part);
+  }
+  if (parts.length === 0) return null;
   return parts.join("/");
 };
 
 const uniquePaths = (paths: readonly CurrentPath[]): CurrentPath[] =>
   [
     ...new Map(
-      paths.map((path) => [`${path.kind}\0${path.value}`, path]),
+      paths.map((path) => [
+        compositeKey([path.kind, path.value, String(path.allowSuffix)]),
+        path,
+      ]),
     ).values(),
   ].sort((left, right) =>
-    compareCodePoints(
-      `${left.kind}\0${left.value}`,
-      `${right.kind}\0${right.value}`,
+    compareUnicodeCodePoints(
+      compositeKey([left.kind, left.value]),
+      compositeKey([right.kind, right.value]),
     ),
   );
 

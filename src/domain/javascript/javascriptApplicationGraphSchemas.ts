@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { javascriptSourceMapReferenceSchema } from "./javascriptSourceMapPaths.js";
 import {
   applicationCoverageSchema,
   applicationGraphEvidenceSchema,
@@ -7,8 +8,11 @@ import {
 } from "./javascriptApplicationEvidenceSchemas.js";
 import { jsonValueSchema } from "../jsonValue.js";
 import { prefixedDigestSchema } from "../digests.js";
+import { nonEmptyTextSchema } from "../textSchemas.js";
 
-const boundedTextSchema = z.string().min(1);
+/** An observed IPC channel match whose uniqueness is not established. */
+export const IPC_COVERAGE_LIMITED_PAIRING_BASIS =
+  "observed-literal-channel-incomplete-coverage";
 
 /** Node kinds admitted by JavaScript Application Graph. */
 export const JAVASCRIPT_APPLICATION_NODE_KINDS = [
@@ -23,6 +27,7 @@ export const JAVASCRIPT_APPLICATION_NODE_KINDS = [
   "javascript-asset",
   "javascript-chunk",
   "javascript-module",
+  "javascript-expression",
   "source-map",
   "source-module",
   "browser-window",
@@ -31,6 +36,7 @@ export const JAVASCRIPT_APPLICATION_NODE_KINDS = [
   "context-bridge-api",
   "ipc-channel",
   "ipc-handler",
+  "url-scheme",
   "worker",
   "service-worker",
   "endpoint",
@@ -62,6 +68,7 @@ export const JAVASCRIPT_APPLICATION_RELATIONS = [
   "invokes",
   "handles",
   "calls",
+  "accesses",
   "persists_to",
   "observed_as",
   "changed_from",
@@ -76,15 +83,23 @@ const applicationPropertiesSchema = z.record(
 );
 
 /** One node observation before its semantic identifier is derived. */
-const applicationNodeObservationInputSchema = z.strictObject({
+const applicationNodeObservationBaseSchema = z.strictObject({
   label: z.string().min(1).nullable(),
+  source_map_reference: javascriptSourceMapReferenceSchema.nullable(),
   properties: applicationPropertiesSchema,
   evidence: applicationGraphEvidenceSchema,
 });
 
+const applicationNodeObservationInputSchema =
+  applicationNodeObservationBaseSchema.extend({
+    source_map_reference: javascriptSourceMapReferenceSchema
+      .nullable()
+      .default(null),
+  });
+
 /** One immutable, evidence-bearing observation attached to an entity. */
 export const applicationNodeObservationSchema =
-  applicationNodeObservationInputSchema.extend({
+  applicationNodeObservationBaseSchema.extend({
     observation_id: prefixedDigestSchema("jag_observation"),
     identifier_strategy: z.strictObject({
       strategy: z.literal("semantic-content-sha256"),
@@ -132,7 +147,7 @@ export const javascriptApplicationGraphInputSchema = z.strictObject({
   nodes: z.array(applicationNodeSchema).min(1),
   edges: z.array(applicationEdgeSchema),
   coverage: applicationCoverageSchema,
-  limitations: z.array(boundedTextSchema),
+  limitations: z.array(nonEmptyTextSchema),
 });
 
 /** Strict stored shape for a JavaScript Application Graph. */

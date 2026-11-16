@@ -1,24 +1,16 @@
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+import { normalizeTestTemporaryPrefix } from "../../../scripts/lib/test-temporary-ownership.mjs";
 
 /** An isolated filesystem and environment projection owned by one test. */
 export interface TestWorkspace {
   readonly root: string;
   readonly home: string;
-  readonly xdgConfigHome: string;
-  readonly xdgCacheHome: string;
   readonly environment: NodeJS.ProcessEnv;
   path(...segments: readonly string[]): string;
   mkdir(relativePath: string): Promise<string>;
-  read(relativePath: string): Promise<string>;
   write(relativePath: string, contents: string | Uint8Array): Promise<string>;
 }
 
@@ -38,7 +30,9 @@ export const createTestWorkspace = async (
 ): Promise<TestWorkspace> => {
   const canonicalTemporaryRoot = await realpath(tmpdir());
   const root = await realpath(
-    await mkdtemp(join(canonicalTemporaryRoot, prefix)),
+    await mkdtemp(
+      join(canonicalTemporaryRoot, normalizeTestTemporaryPrefix(prefix)),
+    ),
   );
   const home = join(root, "home");
   const xdgConfigHome = join(root, "xdg", "config");
@@ -64,8 +58,6 @@ export const createTestWorkspace = async (
   return {
     root,
     home,
-    xdgConfigHome,
-    xdgCacheHome,
     environment: {
       HOME: home,
       XDG_CONFIG_HOME: xdgConfigHome,
@@ -77,7 +69,6 @@ export const createTestWorkspace = async (
       await mkdir(path, { recursive: true });
       return path;
     },
-    read: (relativePath) => readFile(resolvePath(relativePath), "utf8"),
     write: async (relativePath, contents) => {
       const path = resolvePath(relativePath);
       await mkdir(dirname(path), { recursive: true });

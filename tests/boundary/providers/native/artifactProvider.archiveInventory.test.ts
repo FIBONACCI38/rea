@@ -1,3 +1,5 @@
+import { createOwnedArtifactClient } from "../../../support/artifactClientScope.js";
+import { projectCliAnalysisResult } from "../../../../src/cli/projectCliAnalysisResult.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -7,13 +9,14 @@ import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 
-import { runProviderAnalysis } from "../../../../src/composition/directAnalysis.js";
-import { ArtifactProvider } from "../../../../src/artifacts/ArtifactProvider.js";
+import { createDirectAnalysis } from "../../../../src/composition/directAnalysis.js";
 import { artifactInventoryResultSchema } from "../../../../src/domain/artifactGraph.js";
 import { artifactInspectionResultSchema } from "../../../../src/domain/artifactInspection.js";
-import type { BinaryTarget } from "../../../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 import { parseBinaryTarget } from "../../../../src/application/BinaryTargetResolver.js";
 import { parseEvidence } from "../../../../src/domain/evidence.js";
+
+const { runProviderAnalysis } = createDirectAnalysis({});
 
 describe("artifact archive inventory", () => {
   it("returns complete ZIP and official ASAR inventories inline", async () => {
@@ -28,11 +31,13 @@ describe("artifact archive inventory", () => {
     if (!parsed.ok) return;
     const zipResult = await inventory(parsed.value);
     expect(zipResult.occurrences.length).toBe(3);
-    expect(zipResult.nodes.map(({ kind }) => kind)).toEqual(
-      expect.arrayContaining(["javascript", "dynamic-library"]),
-    );
+    expect(
+      zipResult.occurrences.map(({ artifact_kind }) => artifact_kind),
+    ).toEqual(expect.arrayContaining(["javascript", "dynamic-library"]));
     const cliEvidence = parseEvidence(
-      await runProviderAnalysis(zipPath, "inventory_artifact", {}),
+      await runProviderAnalysis(zipPath, "inventory_artifact", {}).then(
+        projectCliAnalysisResult,
+      ),
     );
     expect(cliEvidence).toMatchObject({
       operation: "inventory_artifact",
@@ -40,7 +45,9 @@ describe("artifact archive inventory", () => {
       subject: { format: "apk" },
     });
     const inspectionEvidence = parseEvidence(
-      await runProviderAnalysis(zipPath, "inspect_artifact", {}),
+      await runProviderAnalysis(zipPath, "inspect_artifact", {}).then(
+        projectCliAnalysisResult,
+      ),
     );
     const inspection = artifactInspectionResultSchema.parse(
       inspectionEvidence.normalized_result,
@@ -58,6 +65,18 @@ describe("artifact archive inventory", () => {
     expect(inspectionEvidence.evidence_links).toEqual(
       inspection.evidence_links,
     );
+    // The graph is delivered once, in the nested inventory Evidence.
+    expect(
+      artifactInventoryResultSchema.parse(
+        inspection.substeps[0]?.evidence.normalized_result,
+      ).occurrences,
+    ).toHaveLength(3);
+    // Occurrences name every logical path; neither Evidence repeats them.
+    expect(inspectionEvidence.locations).toEqual([]);
+    expect(inspection.substeps[0]?.evidence.locations).toEqual([]);
+    expect(inspection.observations.map(({ kind }) => kind)).toEqual([
+      "root-manifest",
+    ]);
     const cancellation = new AbortController();
     cancellation.abort();
     await expect(
@@ -67,7 +86,7 @@ describe("artifact archive inventory", () => {
         {},
         undefined,
         cancellation.signal,
-      ),
+      ).then(projectCliAnalysisResult),
     ).resolves.toMatchObject({ code: "cancelled" });
     await expect(
       runProviderAnalysis(
@@ -76,7 +95,7 @@ describe("artifact archive inventory", () => {
         {},
         undefined,
         cancellation.signal,
-      ),
+      ).then(projectCliAnalysisResult),
     ).resolves.toMatchObject({ code: "cancelled" });
 
     const source = join(root, "asar-source");
@@ -84,7 +103,7 @@ describe("artifact archive inventory", () => {
     await writeFile(join(source, "main.js"), "console.log('ok');\n");
     const asarPath = join(root, "app.asar");
     await createPackage(source, asarPath);
-    const asarResult = await inventory(target(asarPath, "asar"));
+    const asarResult = await inventory(await target(asarPath));
     expect(asarResult.occurrences).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ logical_path: "main.js" }),
@@ -93,7 +112,7 @@ describe("artifact archive inventory", () => {
 
     const unpackedPath = join(root, "unpacked.asar");
     await createPackageWithOptions(source, unpackedPath, { unpack: "*.js" });
-    const unpackedResult = await inventory(target(unpackedPath, "asar"));
+    const unpackedResult = await inventory(await target(unpackedPath));
     expect(unpackedResult.occurrences).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -106,9 +125,9 @@ describe("artifact archive inventory", () => {
       join(`${unpackedPath}.unpacked`, "main.js"),
       "changed();\n",
     );
-    const corrupted = await new ArtifactProvider()
-      .createClient(target(unpackedPath, "asar"))
-      .execute("inventory_artifact", {});
+    const corrupted = await createOwnedArtifactClient(
+      await target(unpackedPath),
+    ).execute("inventory_artifact", {});
     expect(corrupted).toMatchObject({
       ok: false,
       error: {
@@ -120,9 +139,9 @@ describe("artifact archive inventory", () => {
         },
       },
     });
-    const failedInspection = await new ArtifactProvider()
-      .createClient(target(unpackedPath, "asar"))
-      .execute("inspect_artifact", {});
+    const failedInspection = await createOwnedArtifactClient(
+      await target(unpackedPath),
+    ).execute("inspect_artifact", {});
     expect(failedInspection).toMatchObject({
       ok: false,
       error: { _tag: "ArtifactOperationError", reason: "integrity" },
@@ -130,20 +149,16 @@ describe("artifact archive inventory", () => {
   });
 });
 const inventory = async (targetValue: BinaryTarget) => {
-  const result = await new ArtifactProvider()
-    .createClient(targetValue)
-    .execute("inventory_artifact", {});
+  const result = await createOwnedArtifactClient(targetValue).execute(
+    "inventory_artifact",
+    {},
+  );
   if (!result.ok) throw result.error;
   return artifactInventoryResultSchema.parse(result.value.result);
 };
 
-const target = (
-  path: string,
-  format: Extract<BinaryTarget, { kind: "archive" }>["format"] | "directory",
-): BinaryTarget => ({
-  path,
-  sourcePath: path,
-  sha256: "0".repeat(64),
-  kind: "archive",
-  format: format === "directory" ? "asar" : format,
-});
+const target = async (path: string): Promise<BinaryTarget> => {
+  const parsed = await parseBinaryTarget(path);
+  if (!parsed.ok) throw parsed.error;
+  return parsed.value;
+};

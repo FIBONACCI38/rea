@@ -10,6 +10,7 @@ const execute = promisify(execFile);
 const root = resolve(import.meta.dirname, "..");
 
 const temporary = await mkdtemp(join(tmpdir(), "rea-test-discovery-"));
+let discovered;
 try {
   const output = join(temporary, "discovery.json");
   await execute(
@@ -39,7 +40,7 @@ try {
   const expected = [];
   for (const path of files.stdout
     .split("\0")
-    .filter((path) => path.endsWith(".test.ts"))) {
+    .filter((path) => /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(path))) {
     try {
       if ((await stat(join(root, path))).isFile()) expected.push(path);
     } catch (cause) {
@@ -54,12 +55,16 @@ try {
   if (
     report.missing.length ||
     report.unexpected.length ||
-    report.duplicates.length
+    report.duplicates.length ||
+    report.wrongProjects.length
   ) {
     console.error(JSON.stringify(report, null, 2));
     process.exitCode = 1;
-  } else
-    console.log(`Discovered all ${report.discovered} test files exactly once.`);
+  } else discovered = report.discovered;
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
+if (discovered !== undefined)
+  console.log(
+    `Discovered all ${discovered} test and spec files in src and tests exactly once.`,
+  );

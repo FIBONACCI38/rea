@@ -1,13 +1,5 @@
-/** Exact upstream package profile for unchanged offline HAR validation and numeric parsing. */
-export const HAR_CAPTURE_PROVIDER_IDENTITY = {
-  id: "har-schema/lossless-json",
-  name: "REA HAR capture adapter",
-  version: "har-schema@2.0.0;jsonc-parser@3.3.1;lossless-json@4.3.1",
-} as const;
+import { javaScriptRuntime } from "../../domain/runtimeVersion.js";
 
-/** Native executable profile verified with unchanged mitmproxy raw-state decoding. */
-export const MITMPROXY_CAPTURE_PROVIDER_IDENTITY = {
-  id: "mitmproxy-native-tnetstring",
-  name: "REA offline native mitmproxy adapter",
-  version: "12.2.3",
-} as const;
+/** The Node capture decoder runs on this executable; Bun accepts but ignores V8 heap flags. */
+export const NODE_CAPTURE_HEAP_ENFORCED =
+  javaScriptRuntime(process.versions).id === "node";

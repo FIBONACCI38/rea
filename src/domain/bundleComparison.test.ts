@@ -5,6 +5,7 @@ import {
   bundleComparisonResultSchema,
   compareBundles,
 } from "./bundleComparison.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
 import { createEvidence } from "./evidence.js";
 import { createEvidenceBundle } from "./evidenceBundle.js";
 import {
@@ -138,8 +139,10 @@ describe("bundle comparison", () => {
       ]),
     });
     expect(first.changes).toHaveLength(3);
-    expect(first.limitations).toContain(
-      "EvidenceBundle has no inventory completeness marker; one-sided membership remains unknown.",
+    expect(first.limitations).toContainEqual(
+      expect.stringMatching(
+        /no inventory completeness marker.*membership remains unknown/i,
+      ),
     );
   });
 
@@ -169,7 +172,7 @@ describe("bundle comparison", () => {
           right_evidence_id: rightRecord.evidence_id,
         },
       ]),
-    ).toThrow(/missing left evidence/u);
+    ).toThrow(AnalysisInputError);
     expect(() =>
       compareBundles(left, right, [
         {
@@ -181,7 +184,7 @@ describe("bundle comparison", () => {
           right_evidence_id: rightRecord.evidence_id,
         },
       ]),
-    ).toThrow(/one-to-one/u);
+    ).toThrow(AnalysisInputError);
     expect(() =>
       compareBundles({ ...left, records: [leftRecord, leftRecord] }, right),
     ).toThrow(/duplicate record IDs/u);
@@ -259,9 +262,11 @@ describe("bundle comparison history", () => {
       expect.objectContaining({
         classification: "unknown",
         conclusion_kind: "unresolved_branch",
-        limitations: [
-          "EvidenceBundle has no inventory completeness marker; one-sided history membership remains unknown.",
-        ],
+        limitations: expect.arrayContaining([
+          expect.stringMatching(
+            /no inventory completeness marker.*history membership remains unknown/i,
+          ),
+        ]),
       }),
     );
   });

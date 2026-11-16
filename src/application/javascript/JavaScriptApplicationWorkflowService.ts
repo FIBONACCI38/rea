@@ -1,24 +1,45 @@
-import { z } from "zod";
-
+import type { ExecutionOptions } from "../AnalysisProvider.js";
 import {
-  AnalysisInputError,
-  AnalysisProtocolError,
-} from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
-import type { Evidence } from "../../domain/evidence.js";
-import { projectInputIssues } from "../../domain/inputIssueProjection.js";
+  resolveEvidenceRequest,
+  type EvidenceLookup,
+} from "../EvidenceInputResolver.js";
+import {
+  compareApplicationVersionsRequestSchema,
+  compareJavaScriptExportShapesRequestSchema,
+  compareSourceToBundleCliInputSchema,
+  compareSourceToBundleRequestSchema,
+  traceApplicationFeatureRequestSchema,
+} from "../../contracts/javascript/applicationWorkflowInputContracts.js";
+import type { EvidenceWorkflowExecution } from "../investigation/EvidenceWorkflowExecution.js";
+import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
+import type { ResolvedSourceToBundleReference } from "./SourceToBundleReference.js";
+
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { compareJavaScriptApplicationVersions } from "../../domain/javascript/javascriptApplicationVersionComparison.js";
-import { compareApplicationVersionsInputSchema } from "../../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
+import {
+  applicationVersionIdentitiesSchema,
+  type ApplicationVersionComparisonResult,
+} from "../../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
 import { compareJavaScriptExportShapes } from "../../domain/javascript/javascriptExportShapeComparison.js";
-import { compareJavaScriptExportShapesInputSchema } from "../../domain/javascript/javascriptExportShapeComparisonSchemas.js";
+import {
+  javaScriptExportShapeIdentitiesSchema,
+  type JavaScriptExportShapeComparisonResult,
+} from "../../domain/javascript/javascriptExportShapeComparisonSchemas.js";
 import { traceApplicationFeature } from "../../domain/javascript/javascriptFeatureTrace.js";
-import { traceApplicationFeatureInputSchema } from "../../domain/javascript/javascriptFeatureTraceSchemas.js";
+import {
+  applicationTraceIdentitiesSchema,
+  type ApplicationFeatureTraceResult,
+} from "../../domain/javascript/javascriptFeatureTraceSchemas.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { compareSourceToBundle } from "../../domain/javascript/sourceToBundleComparison.js";
-import { compareSourceToBundleInputSchema } from "../../domain/javascript/sourceToBundleComparisonSchemas.js";
+import type { SourceToBundleComparisonResult } from "../../domain/javascript/sourceToBundleComparisonSchemas.js";
 import {
+  applicationGraphEvidenceInputError,
+  applicationGraphSubjectTarget,
   parseApplicationGraphEvidence,
   parseNativeApplicationEvidence,
+  type ApplicationGraphEvidenceSource,
 } from "./JavaScriptApplicationEvidenceGraph.js";
 import {
   createApplicationFeatureTraceEvidence,
@@ -27,146 +48,263 @@ import {
   createSourceToBundleComparisonEvidence,
 } from "./JavaScriptApplicationWorkflowEvidence.js";
 
+/** Completed workflow facts and authenticated sources retained for adapter delivery. */
+export interface ApplicationWorkflowExecution<
+  Projection,
+> extends EvidenceWorkflowExecution {
+  readonly result: Projection;
+}
+
+/** Authenticate the resolved graph pair at the owning domain boundary. */
+const parseApplicationGraphPair = (
+  operation: string,
+  input: { readonly left: unknown; readonly right: unknown },
+): Result<
+  {
+    readonly left: ApplicationGraphEvidenceSource;
+    readonly right: ApplicationGraphEvidenceSource;
+  },
+  AnalysisError
+> => {
+  const left = parseApplicationGraphEvidence(input.left, ["left"]);
+  if (!left.ok)
+    return err(applicationGraphEvidenceInputError(operation, left.error));
+  const right = parseApplicationGraphEvidence(input.right, ["right"]);
+  if (!right.ok)
+    return err(applicationGraphEvidenceInputError(operation, right.error));
+  return ok({
+    left: left.value,
+    right: right.value,
+  });
+};
+
 /** Authenticate Evidence and derive one bounded cross-layer feature trace. */
 export const traceApplicationFeatureEvidence = (
   rawInput: unknown,
-): Result<Evidence, AnalysisError> => {
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<
+  ApplicationWorkflowExecution<ApplicationFeatureTraceResult>,
+  AnalysisError
+> => {
   const operation = "trace_application_feature";
-  const parsed = traceApplicationFeatureInputSchema.safeParse(rawInput);
-  if (!parsed.success)
+  const request = resolveEvidenceRequest(
+    operation,
+    rawInput,
+    traceApplicationFeatureRequestSchema,
+    lookup,
+    options,
+  );
+  if (!request.ok) return request;
+  const input = request.value.input;
+  const sourceResult = parseApplicationGraphEvidence(input.application, [
+    "application",
+  ]);
+  if (!sourceResult.ok)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      applicationGraphEvidenceInputError(operation, sourceResult.error),
     );
-  return traceApplicationFeatureEvidenceValidated(parsed.data);
-};
-
-/** Derive one feature trace from input parsed by a trusted adapter. */
-export const traceApplicationFeatureEvidenceValidated = (
-  input: z.output<typeof traceApplicationFeatureInputSchema>,
-): Result<Evidence, AnalysisError> => {
-  const operation = "trace_application_feature";
-  try {
-    const source = parseApplicationGraphEvidence(input.application);
-    const nativeEvidence = parseNativeApplicationEvidence(
-      input.native_observations,
+  const nativeResult = parseNativeApplicationEvidence(
+    input.native_observations,
+    ["native_observations"],
+  );
+  if (!nativeResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, nativeResult.error),
     );
-    const result = traceApplicationFeature({
-      sourceEvidenceId: source.evidence.evidence_id,
-      graph: source.graph,
-      nativeEvidence,
+  const source = sourceResult.value;
+  const nativeEvidence = nativeResult.value;
+  const identities = applicationTraceIdentitiesSchema.safeParse({
+    native_observations: nativeEvidence,
+  });
+  if (!identities.success)
+    return err(
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
+    );
+  const result = traceApplicationFeature({
+    sourceEvidenceId: source.evidence.evidence_id,
+    graph: source.graph,
+    semanticGraph: source.semanticGraph,
+    ...(input.semantic_page === undefined
+      ? {}
+      : { semanticPage: input.semantic_page }),
+    nativeEvidence,
+    seed: input.seed,
+    direction: input.direction,
+  });
+  const evidence = createApplicationFeatureTraceEvidence(
+    applicationGraphSubjectTarget(source),
+    {
+      application_evidence_id: source.evidence.evidence_id,
+      native_evidence_ids: nativeEvidence.map(({ evidence_id: id }) => id),
       seed: input.seed,
       direction: input.direction,
-    });
-    return ok(
-      createApplicationFeatureTraceEvidence(
-        {
-          application_evidence_id: source.evidence.evidence_id,
-          native_evidence_ids: nativeEvidence.map(({ evidence_id: id }) => id),
-          seed: input.seed,
-          direction: input.direction,
-        },
-        result,
-      ),
-    );
-  } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
-  }
+      ...(input.semantic_page === undefined
+        ? {}
+        : { semantic_page: input.semantic_page }),
+    },
+    result,
+  );
+  return ok({
+    evidence,
+    result,
+    sources: [source.evidence, ...nativeEvidence],
+  });
 };
 
 /** Authenticate both graphs and derive a tiered cross-version change graph. */
 export const compareApplicationVersionsEvidence = (
   rawInput: unknown,
-): Result<Evidence, AnalysisError> => {
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<
+  ApplicationWorkflowExecution<ApplicationVersionComparisonResult>,
+  AnalysisError
+> => {
   const operation = "compare_application_versions";
-  const parsed = compareApplicationVersionsInputSchema.safeParse(rawInput);
-  if (!parsed.success)
+  const request = resolveEvidenceRequest(
+    operation,
+    rawInput,
+    compareApplicationVersionsRequestSchema,
+    lookup,
+    options,
+  );
+  if (!request.ok) return request;
+  const input = request.value.input;
+  const pair = parseApplicationGraphPair(operation, input);
+  if (!pair.ok) return pair;
+  const { left, right } = pair.value;
+  const leftNativeResult = parseNativeApplicationEvidence(
+    input.left_native_observations,
+    ["left_native_observations"],
+  );
+  if (!leftNativeResult.ok)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      applicationGraphEvidenceInputError(operation, leftNativeResult.error),
     );
-  return compareApplicationVersionsEvidenceValidated(parsed.data);
+  const rightNativeResult = parseNativeApplicationEvidence(
+    input.right_native_observations,
+    ["right_native_observations"],
+  );
+  if (!rightNativeResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, rightNativeResult.error),
+    );
+  const leftNative = leftNativeResult.value;
+  const rightNative = rightNativeResult.value;
+  const identities = applicationVersionIdentitiesSchema.safeParse({
+    left: left.evidence,
+    right: right.evidence,
+    left_native_observations: leftNative,
+    right_native_observations: rightNative,
+  });
+  if (!identities.success)
+    return err(
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
+    );
+  const result = compareJavaScriptApplicationVersions({
+    left: {
+      evidenceId: left.evidence.evidence_id,
+      rootArtifactSha256: left.rootArtifactSha256,
+      graph: left.graph,
+    },
+    right: {
+      evidenceId: right.evidence.evidence_id,
+      rootArtifactSha256: right.rootArtifactSha256,
+      graph: right.graph,
+    },
+    leftNativeEvidence: leftNative,
+    rightNativeEvidence: rightNative,
+  });
+  const evidence = createApplicationVersionComparisonEvidence(
+    {
+      left_evidence_id: left.evidence.evidence_id,
+      right_evidence_id: right.evidence.evidence_id,
+      left_native_evidence_ids: leftNative.map(({ evidence_id: id }) => id),
+      right_native_evidence_ids: rightNative.map(({ evidence_id: id }) => id),
+    },
+    result,
+  );
+  return ok({
+    evidence,
+    result,
+    sources: [left.evidence, right.evidence, ...leftNative, ...rightNative],
+  });
 };
 
-/** Compare versions from input parsed by a trusted adapter. */
-export const compareApplicationVersionsEvidenceValidated = (
-  input: z.output<typeof compareApplicationVersionsInputSchema>,
-): Result<Evidence, AnalysisError> => {
-  const operation = "compare_application_versions";
-  try {
-    const left = parseApplicationGraphEvidence(input.left);
-    const right = parseApplicationGraphEvidence(input.right);
-    const leftNative = parseNativeApplicationEvidence(
-      input.left_native_observations,
-    );
-    const rightNative = parseNativeApplicationEvidence(
-      input.right_native_observations,
-    );
-    const result = compareJavaScriptApplicationVersions({
-      left: {
-        evidenceId: left.evidence.evidence_id,
-        rootArtifactSha256: left.rootArtifactSha256,
-        graph: left.graph,
-      },
-      right: {
-        evidenceId: right.evidence.evidence_id,
-        rootArtifactSha256: right.rootArtifactSha256,
-        graph: right.graph,
-      },
-      leftNativeEvidence: leftNative,
-      rightNativeEvidence: rightNative,
-    });
-    return ok(
-      createApplicationVersionComparisonEvidence(
-        {
-          left_evidence_id: left.evidence.evidence_id,
-          right_evidence_id: right.evidence.evidence_id,
-          left_native_evidence_ids: leftNative.map(({ evidence_id: id }) => id),
-          right_native_evidence_ids: rightNative.map(
-            ({ evidence_id: id }) => id,
-          ),
-        },
-        result,
-      ),
-    );
-  } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
-  }
+/** Select the application record and historical graph through their shared owners. */
+export const executeSourceToBundleComparison = async (
+  rawInput: unknown,
+  schema:
+    | typeof compareSourceToBundleCliInputSchema
+    | typeof compareSourceToBundleRequestSchema,
+  lookup: EvidenceLookup | undefined,
+  resources: ArtifactResourceScope,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Promise<
+  Result<
+    ApplicationWorkflowExecution<SourceToBundleComparisonResult>,
+    AnalysisError
+  >
+> => {
+  const selected = resolveEvidenceRequest(
+    "compare_source_to_bundle",
+    rawInput,
+    schema,
+    lookup,
+    options,
+  );
+  if (!selected.ok) return selected;
+  const { resolveSourceToBundleReference } =
+    await import("./SourceToBundleReference.js");
+  const reference = await resolveSourceToBundleReference(
+    selected.value.input.reference,
+    options.signal,
+    resources,
+  );
+  return reference.ok
+    ? compareSourceToBundleEvidence({
+        ...reference.value,
+        application: selected.value.input.application,
+      })
+    : reference;
 };
 
-/** Compare source and bundle inputs already parsed by a trusted adapter. */
-export const compareSourceToBundleEvidenceValidated = (
-  input: z.output<typeof compareSourceToBundleInputSchema>,
-): Result<Evidence, AnalysisError> => {
+/** Compare an owner-parsed historical graph with an unadmitted application source. */
+const compareSourceToBundleEvidence = (
+  input: ResolvedSourceToBundleReference & { readonly application: unknown },
+): Result<
+  ApplicationWorkflowExecution<SourceToBundleComparisonResult>,
+  AnalysisError
+> => {
   const operation = "compare_source_to_bundle";
-  try {
-    const application = parseApplicationGraphEvidence(input.application);
-    const result = compareSourceToBundle({
-      reference: input.reference,
-      application: {
-        evidenceId: application.evidence.evidence_id,
-        rootArtifactSha256: application.rootArtifactSha256,
-        graph: application.graph,
-      },
-    });
-    return ok(
-      createSourceToBundleComparisonEvidence(
-        {
-          reference_root_sha256: input.reference.root_sha256,
-          application_evidence_id: application.evidence.evidence_id,
-        },
-        result,
-      ),
+  const applicationResult = parseApplicationGraphEvidence(input.application, [
+    "application",
+  ]);
+  if (!applicationResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, applicationResult.error),
     );
-  } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
-  }
+  const application = applicationResult.value;
+  const result = compareSourceToBundle({
+    reference: input.reference,
+    application: {
+      evidenceId: application.evidence.evidence_id,
+      rootArtifactSha256: application.rootArtifactSha256,
+      graph: application.graph,
+    },
+  });
+  const evidence = createSourceToBundleComparisonEvidence(
+    {
+      reference_root_sha256: input.reference.root_sha256,
+      application_evidence_id: application.evidence.evidence_id,
+      ...(input.reference_source === undefined
+        ? {}
+        : { reference_source: input.reference_source }),
+    },
+    result,
+  );
+  return ok({ evidence, result, sources: [application.evidence] });
 };
 
 /**
@@ -175,106 +313,57 @@ export const compareSourceToBundleEvidenceValidated = (
  */
 export const compareJavaScriptExportShapesEvidence = (
   rawInput: unknown,
-): Result<Evidence, AnalysisError> => {
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<
+  ApplicationWorkflowExecution<JavaScriptExportShapeComparisonResult>,
+  AnalysisError
+> => {
   const operation = "compare_javascript_export_shapes";
-  const parsed = compareJavaScriptExportShapesInputSchema.safeParse(rawInput);
-  if (!parsed.success)
+  const request = resolveEvidenceRequest(
+    operation,
+    rawInput,
+    compareJavaScriptExportShapesRequestSchema,
+    lookup,
+    options,
+  );
+  if (!request.ok) return request;
+  const input = request.value.input;
+  const pair = parseApplicationGraphPair(operation, input);
+  if (!pair.ok) return pair;
+  const { left, right } = pair.value;
+  const identities = javaScriptExportShapeIdentitiesSchema.safeParse({
+    left: left.evidence,
+    right: right.evidence,
+  });
+  if (!identities.success)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
     );
-  return compareJavaScriptExportShapesEvidenceValidated(parsed.data);
+  const result = compareJavaScriptExportShapes({
+    left: {
+      evidenceId: left.evidence.evidence_id,
+      graph: left.graph,
+      modulePath: input.left_module_path,
+      exportName: input.left_export_name,
+    },
+    right: {
+      evidenceId: right.evidence.evidence_id,
+      graph: right.graph,
+      modulePath: input.right_module_path,
+      exportName: input.right_export_name,
+    },
+  });
+  const evidence = createJavaScriptExportShapeComparisonEvidence(
+    {
+      left_evidence_id: left.evidence.evidence_id,
+      right_evidence_id: right.evidence.evidence_id,
+      left_module_path: input.left_module_path,
+      left_export_name: input.left_export_name,
+      right_module_path: input.right_module_path,
+      right_export_name: input.right_export_name,
+    },
+    result,
+  );
+  return ok({ evidence, result, sources: [left.evidence, right.evidence] });
 };
-
-/** Compare exact export shapes from input parsed by a trusted adapter. */
-export const compareJavaScriptExportShapesEvidenceValidated = (
-  input: z.output<typeof compareJavaScriptExportShapesInputSchema>,
-): Result<Evidence, AnalysisError> => {
-  const operation = "compare_javascript_export_shapes";
-  try {
-    const left = parseApplicationGraphEvidence(input.left);
-    const right = parseApplicationGraphEvidence(input.right);
-    const result = compareJavaScriptExportShapes({
-      left: {
-        evidenceId: left.evidence.evidence_id,
-        graph: left.graph,
-        modulePath: input.left_module_path,
-        exportName: input.left_export_name,
-      },
-      right: {
-        evidenceId: right.evidence.evidence_id,
-        graph: right.graph,
-        modulePath: input.right_module_path,
-        exportName: input.right_export_name,
-      },
-    });
-    return ok(
-      createJavaScriptExportShapeComparisonEvidence(
-        {
-          left_evidence_id: left.evidence.evidence_id,
-          right_evidence_id: right.evidence.evidence_id,
-          left_module_path: input.left_module_path,
-          left_export_name: input.left_export_name,
-          right_module_path: input.right_module_path,
-          right_export_name: input.right_export_name,
-        },
-        result,
-      ),
-    );
-  } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
-  }
-};
-
-const workflowFailure = (
-  operation: string,
-  cause: unknown,
-  input: unknown,
-): Result<never, AnalysisError> =>
-  cause instanceof z.ZodError
-    ? err(
-        new AnalysisInputError(
-          operation,
-          undefined,
-          projectInputIssues(cause.issues, input),
-        ),
-      )
-    : cause instanceof TypeError &&
-        SAFE_APPLICATION_INPUT_CONSTRAINTS.has(cause.message)
-      ? err(
-          new AnalysisInputError(operation, undefined, [
-            { path: [], reason: "invalid_value", message: cause.message },
-          ]),
-        )
-      : err(
-          new AnalysisProtocolError(
-            "JavaScript application workflow produced an invalid result",
-            { cause },
-          ),
-        );
-
-const SAFE_APPLICATION_INPUT_CONSTRAINTS = new Set([
-  "Evidence semantic identifier does not match its record",
-  "Application workflow requires authenticated analyze_javascript_application, reconcile_javascript_runtime, or project_managed_application_graph Evidence",
-  "JavaScript application Evidence authority or confidence is invalid",
-  "JavaScript application Evidence predicate does not match its result shape",
-  "JavaScript application Evidence subject does not match its result",
-  "Runtime reconciliation Evidence authority or confidence is invalid",
-  "Runtime reconciliation result references Evidence outside its envelope",
-  "Runtime reconciliation application layer is missing",
-  "Managed application graph Evidence authority or confidence is invalid",
-  "Managed application graph result references Evidence outside its envelope",
-  "Native handoff Evidence requires an artifact subject",
-  "Native handoff Evidence must be unique",
-  ...[
-    "analyze_javascript_application",
-    "reconcile_javascript_runtime",
-    "project_managed_application_graph",
-  ].map(
-    (operation) =>
-      `Evidence does not match the supported ${operation} contract`,
-  ),
-]);

@@ -1,3 +1,8 @@
+import { selectCdpDiscoveryTarget } from "../browser/CdpDiscoveryTargets.js";
+import {
+  DEFAULT_ASAR_HEADER_ADMISSION,
+  type AsarHeaderAdmission,
+} from "../config/asarHeaderAdmission.js";
 import type {
   ExecutionOptions,
   ProviderIdentity,
@@ -12,20 +17,33 @@ import {
   type ObserveJavaScriptRuntimeInput,
 } from "../domain/javascript/javascriptRuntimeObservation.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { delayWithCancellation } from "../browser/CdpCaptureValues.js";
 import {
-  numberValue,
-  recordValue,
-  cdpStringValue,
-  delayWithCancellation,
-} from "../browser/CdpCaptureValues.js";
-import { CdpConnection, type CdpEvent } from "../browser/CdpConnection.js";
+  readCdpScriptParsed,
+  readCdpExecutionContextCreated,
+  readCdpExecutionContextDestroyed,
+} from "../browser/CdpScriptContextFacts.js";
+import type { CdpConnection, CdpEvent } from "../browser/CdpConnection.js";
 import {
+  ElectronFileScope,
+  mapElectronFileAuthorizationFailure,
+} from "../browser/ElectronFileScope.js";
+import {
+  CdpTargetSessionOwner,
+  bindCdpTransportCleanup,
+} from "../browser/CdpTargetSessionOwner.js";
+import {
+  authorizeRuntimeLocation,
   authorizeRuntimeTargetLocation,
   inspectorExclusionKey,
+  throwIfRuntimeObservationCancelled,
 } from "./JavaScriptRuntimeScope.js";
 import {
   createInspectorExclusionCounts,
@@ -35,44 +53,163 @@ import {
 import {
   discoverV8Inspector,
   type AuthorizedV8InspectorTarget,
-  type V8InspectorTarget,
+  type V8InspectorDiscovery,
 } from "./V8InspectorEndpoint.js";
 
-/** Public identity committed by passive V8 Inspector observations. */
-export { V8_INSPECTOR_PROVIDER_IDENTITY } from "./providerIdentity.js";
 import { V8_INSPECTOR_PROVIDER_IDENTITY } from "./providerIdentity.js";
+
+/**
+ * Admission and transport cleanup for one Inspector host. Providers are created
+ * per operation; the host passes one admission so those providers share cleanup
+ * without a process-global counter.
+ */
+export class V8InspectorAdmission {
+  readonly files = new ElectronFileScope();
+  readonly connections = new CdpTargetSessionOwner();
+  #activeOperations = 0;
+  #closing = false;
+  #closePromise: Promise<void> | undefined;
+  readonly #idleWaiters = new Set<() => void>();
+
+  async run<Value>(
+    operation: BrowserObservationOperation,
+    work: () => Promise<Value>,
+  ): Promise<Value> {
+    if (this.#closing && this.#closePromise !== undefined)
+      await this.#closePromise;
+    if (this.#closing)
+      throw new ProviderAdapterError(
+        V8_INSPECTOR_PROVIDER_IDENTITY.id,
+        operation,
+        {
+          diagnostics: { reason: "provider_closing" },
+          userMessage: "Inspector provider cleanup is in progress.",
+        },
+      );
+    this.#activeOperations += 1;
+    try {
+      return await work();
+    } finally {
+      this.#activeOperations -= 1;
+      if (this.#activeOperations === 0) {
+        for (const resolve of this.#idleWaiters) resolve();
+        this.#idleWaiters.clear();
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.#closePromise !== undefined) return await this.#closePromise;
+    const attempt = this.#closeResources();
+    this.#closePromise = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this.#closePromise === attempt) this.#closePromise = undefined;
+    }
+  }
+
+  async #closeResources(): Promise<void> {
+    this.#closing = true;
+    try {
+      while (this.#activeOperations > 0)
+        await new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
+      const failures: AnalysisError[] = [];
+      try {
+        await this.connections.retryPending();
+      } catch (cause: unknown) {
+        failures.push(providerError(cause, "observe_javascript_runtime"));
+      }
+      try {
+        await this.files.retryCleanup();
+      } catch (cause: unknown) {
+        failures.push(providerError(cause, "observe_javascript_runtime"));
+      }
+      if (failures.length === 0) return;
+      if (failures.length === 1) throw failures[0]!;
+      const cleanup = new ProviderCleanupError(
+        V8_INSPECTOR_PROVIDER_IDENTITY.id,
+        failures.flatMap(({ cleanupResources }) => cleanupResources),
+        { reason: "Inspector provider cleanup remains incomplete." },
+        {
+          operation: "observe_javascript_runtime",
+          cause: new AggregateError(
+            failures,
+            "Inspector provider cleanup owners remain unresolved.",
+          ),
+        },
+      );
+      cleanup.bindCleanupDependencies(failures);
+      throw cleanup;
+    } finally {
+      this.#closing = false;
+    }
+  }
+}
+
+/** Maximum decoded CDP message accepted while observing one Inspector target. */
+export const INSPECTOR_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
+/** Aggregate retained metadata budget, including an estimate of JS object overhead. */
+export const INSPECTOR_MAX_RETAINED_METADATA_BYTES = 8 * 1024 * 1024;
+const RETAINED_OBJECT_OVERHEAD_BYTES = 512;
 
 export interface ScriptDraft {
   readonly rawUrl: string;
   readonly executionContextKey: string | null;
+  readonly executionContextId: number | null;
   readonly cdpHash: string | null;
-  readonly length: number;
-  readonly isModule: boolean;
+  readonly length: number | null;
+  readonly isModule: boolean | null;
 }
 
 export interface ContextDraft {
   readonly contextKey: string;
+  readonly executionContextId: number;
   state: "created" | "destroyed" | "cleared";
+  readonly name: string | null;
   readonly origin: string | null;
 }
 
 export interface CaptureState {
   readonly scripts: ScriptDraft[];
   readonly contexts: Map<string, ContextDraft>;
+  readonly latestContexts: Map<string, ContextDraft>;
   eventsObserved: number;
   eventsRetained: number;
   eventsDropped: number;
   metadataBytes: number;
   scriptsObserved: number;
   invalidScripts: number;
+  parseFailedScripts: number;
+  invalidContexts: number;
   truncated: boolean;
   readonly truncationReasons: Set<string>;
 }
 
 /** Attach-only provider; sends only Runtime.enable and Debugger.enable. */
 export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
+  readonly #asarHeaderAdmission: AsarHeaderAdmission;
+  readonly #admission: V8InspectorAdmission;
+
+  /**
+   * Header admission comes from the composition root's environment.
+   * Pass one {@link V8InspectorAdmission} when several providers must share
+   * transport cleanup. Omitted means this provider owns a fresh admission.
+   */
+  constructor(
+    asarHeaderAdmission: AsarHeaderAdmission = DEFAULT_ASAR_HEADER_ADMISSION,
+    admission: V8InspectorAdmission = new V8InspectorAdmission(),
+  ) {
+    this.#asarHeaderAdmission = asarHeaderAdmission;
+    this.#admission = admission;
+  }
+
   identity(): ProviderIdentity {
     return V8_INSPECTOR_PROVIDER_IDENTITY;
+  }
+
+  async close(): Promise<void> {
+    await this.#admission.close();
   }
 
   async listTargets(
@@ -80,40 +217,127 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
     options: ExecutionOptions = {},
   ): Promise<Result<JavaScriptRuntimeTargetList, AnalysisError>> {
     try {
-      const discovery = await discoverV8Inspector(
+      return await this.#admission.run("list_javascript_runtime_targets", () =>
+        this.#listTargets(input, options),
+      );
+    } catch (cause: unknown) {
+      return err(providerError(cause, "list_javascript_runtime_targets"));
+    }
+  }
+
+  async #listTargets(
+    input: ListJavaScriptRuntimeTargetsInput,
+    options: ExecutionOptions,
+  ): Promise<Result<JavaScriptRuntimeTargetList, AnalysisError>> {
+    let discovery: Awaited<ReturnType<typeof discoverV8Inspector>> | undefined;
+    const allowed: AuthorizedV8InspectorTarget[] = [];
+    const excluded = createInspectorExclusionCounts();
+    let unconnectable = 0;
+    let targetsExamined = 0;
+    try {
+      throwIfRuntimeObservationCancelled(
+        options.signal,
+        "list_javascript_runtime_targets",
+      );
+      await this.#admission.files.retryCleanup();
+      discovery = await discoverV8Inspector(
         input.inspector_endpoint,
         "list_javascript_runtime_targets",
         options.signal,
       );
-      const allowed: AuthorizedV8InspectorTarget[] = [];
-      const excluded = createInspectorExclusionCounts();
       for (const target of discovery.targets) {
-        const decision = await authorizeRuntimeTargetLocation(target.url, {
-          type: target.type,
-          product: discovery.runtime.product,
-        });
+        throwIfRuntimeObservationCancelled(
+          options.signal,
+          "list_javascript_runtime_targets",
+        );
+        const decision = await authorizeRuntimeTargetLocation(
+          target.url,
+          { type: target.type, product: discovery.runtime.product },
+          options.signal,
+          "list_javascript_runtime_targets",
+          this.#asarHeaderAdmission,
+          this.#admission.files,
+        );
         if (!decision.allowed) {
           excluded[inspectorExclusionKey(decision.reason)] += 1;
+          targetsExamined += 1;
           continue;
         }
         if (decision.location.kind === "builtin") {
           excluded.unsupported_location += 1;
+          targetsExamined += 1;
           continue;
         }
-        allowed.push({ ...target, location: decision.location });
+        if (target.webSocketUrl === null) {
+          unconnectable += 1;
+          targetsExamined += 1;
+          continue;
+        }
+        allowed.push({
+          id: target.id,
+          type: target.type,
+          url: target.url,
+          attached: target.attached,
+          webSocketUrl: target.webSocketUrl,
+          location: decision.location,
+        });
+        targetsExamined += 1;
       }
       allowed.sort((left, right) =>
         left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+      );
+      throwIfRuntimeObservationCancelled(
+        options.signal,
+        "list_javascript_runtime_targets",
       );
       return ok(
         javascriptRuntimeTargetListSchema.parse({
           runtime: discovery.runtime,
           targets: allowed.map(projectTarget),
-          excluded: { ...excluded, unconnectable: 0 },
-          limitations: describeInspectorTargetLimitations(),
+          excluded: { ...excluded, unconnectable },
+          limitations: [
+            ...discovery.limitations,
+            ...describeInspectorTargetLimitations(
+              allowed.some((target) => target.attached === null),
+            ),
+          ],
         }),
       );
     } catch (cause: unknown) {
+      if (cause instanceof AnalysisCancelledError && discovery !== undefined) {
+        const complete = targetsExamined === discovery.targets.length;
+        const limitations = [
+          ...discovery.limitations,
+          ...describeInspectorTargetLimitations(
+            allowed.some((target) => target.attached === null),
+          ),
+        ];
+        return err(
+          new AnalysisCancelledError("list_javascript_runtime_targets", {
+            cause: cause.cause,
+            diagnostics: {
+              completed_target_inventory: {
+                runtime: discovery.runtime,
+                targets: allowed
+                  .sort((left, right) =>
+                    left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+                  )
+                  .map(projectTarget),
+                excluded: { ...excluded, unconnectable },
+                targets_examined: targetsExamined,
+                targets_discovered: discovery.targets.length,
+                complete,
+                limitations: complete
+                  ? limitations
+                  : [
+                      ...limitations,
+                      "Cancellation stopped target authorization; unexamined targets are unknown, not excluded.",
+                    ],
+              },
+            },
+          }),
+        );
+      }
       return err(providerError(cause, "list_javascript_runtime_targets"));
     }
   }
@@ -122,35 +346,66 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
     input: ObserveJavaScriptRuntimeInput,
     options: ExecutionOptions = {},
   ): Promise<Result<JavaScriptRuntimeObservation, AnalysisError>> {
+    try {
+      return await this.#admission.run("observe_javascript_runtime", () =>
+        this.#observe(input, options),
+      );
+    } catch (cause: unknown) {
+      return err(providerError(cause, "observe_javascript_runtime"));
+    }
+  }
+
+  async #observe(
+    input: ObserveJavaScriptRuntimeInput,
+    options: ExecutionOptions,
+  ): Promise<Result<JavaScriptRuntimeObservation, AnalysisError>> {
     let connection: CdpConnection | undefined;
-    let primaryFailure: unknown;
-    let failed = false;
+    let discovery: Awaited<ReturnType<typeof discoverV8Inspector>> | undefined;
+    let target: AuthorizedV8InspectorTarget | undefined;
+    let state: CaptureState | undefined;
     let cleanupFailure: unknown;
     let cleanupFailed = false;
+    let connectionClosePromise: Promise<void> | undefined;
     let outcome:
       | Result<JavaScriptRuntimeObservation, AnalysisError>
       | undefined;
+    const closeConnection = (): Promise<void> => {
+      if (connection === undefined) return Promise.resolve();
+      const ownedConnection = connection;
+      connectionClosePromise ??=
+        this.#admission.connections.finish(ownedConnection);
+      return connectionClosePromise;
+    };
     try {
-      const discovery = await discoverV8Inspector(
+      throwIfRuntimeObservationCancelled(options.signal);
+      await this.#admission.connections.retryPending();
+      await this.#admission.files.retryCleanup();
+      discovery = await discoverV8Inspector(
         input.inspector_endpoint,
         "observe_javascript_runtime",
         options.signal,
       );
-      const target = await authorizedTarget(
-        discovery.targets,
+      target = await authorizedTarget(
+        discovery,
         input,
-        discovery.runtime.product,
+        this.#asarHeaderAdmission,
+        options.signal,
+        this.#admission.files,
       );
       if (input.runtime_kind !== undefined)
         assertRuntimeKind(target, input.runtime_kind);
-      connection = await CdpConnection.connect(
+      throwIfRuntimeObservationCancelled(options.signal);
+      connection = await this.#admission.connections.connect(
         target.webSocketUrl,
         "observe_javascript_runtime",
-        options.signal,
+        options,
+        "browser_transport",
+        { maxPayloadBytes: INSPECTOR_MAX_PAYLOAD_BYTES },
       );
-      const state = emptyCaptureState();
+      const captureState = emptyCaptureState();
+      state = captureState;
       const removeListener = connection.onEvent((event) =>
-        ingestEvent(event, input, state),
+        ingestEvent(event, captureState),
       );
       try {
         await connection.send("Runtime.enable", {}, undefined, options.signal);
@@ -162,25 +417,97 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
       const result = await finalizeInspectorCapture({
         input,
         runtime: discovery.runtime,
+        discoveryLimitations: discovery.limitations,
         target,
-        state,
+        state: captureState,
+        authorizeLocation: (rawUrl, signal) =>
+          authorizeRuntimeLocation(
+            rawUrl,
+            signal,
+            "observe_javascript_runtime",
+            this.#asarHeaderAdmission,
+            this.#admission.files,
+          ),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
       outcome = ok(javascriptRuntimeObservationSchema.parse(result));
     } catch (cause: unknown) {
-      failed = true;
-      primaryFailure = cause;
-      outcome = err(providerError(cause, "observe_javascript_runtime"));
+      const error = providerError(cause, "observe_javascript_runtime");
+      if (
+        state !== undefined &&
+        discovery !== undefined &&
+        target !== undefined
+      ) {
+        try {
+          const partialObservation = await finalizeInspectorCapture({
+            input,
+            runtime: discovery.runtime,
+            discoveryLimitations: discovery.limitations,
+            target,
+            state,
+            locationMode: "reported",
+          });
+          error.retainPartialObservation(partialObservation);
+        } catch (projectionFailure: unknown) {
+          error.retainSecondaryFailure(
+            new ProviderAdapterError(
+              V8_INSPECTOR_PROVIDER_IDENTITY.id,
+              "observe_javascript_runtime",
+              {
+                cause: projectionFailure,
+                userMessage:
+                  "Inspector partial observations could not be projected.",
+              },
+            ),
+          );
+        }
+      }
+      outcome = err(error);
     } finally {
       if (connection !== undefined)
         try {
-          await closeInspectorConnection(connection, options.signal);
+          await closeConnection();
         } catch (cause: unknown) {
           cleanupFailed = true;
           cleanupFailure = cause;
         }
     }
+    // Cancellation can arrive after capture has completed while the owner is
+    // waiting for its bounded transport close. Preserve it as the primary
+    // result even when cleanup completed normally.
+    if (options.signal?.aborted === true && outcome?.ok === true) {
+      const cancellation = new AnalysisCancelledError(
+        "observe_javascript_runtime",
+        {
+          cause: options.signal.reason,
+          partialObservation: outcome.value,
+        },
+      );
+      outcome = err(cancellation);
+    }
     if (cleanupFailed) {
-      return err(inspectorCleanupError(primaryFailure, cleanupFailure, failed));
+      const cleanup =
+        cleanupFailure instanceof AnalysisError
+          ? cleanupFailure
+          : providerError(cleanupFailure, "observe_javascript_runtime");
+      const primary = outcome?.ok === false ? outcome.error : undefined;
+      const partialObservation =
+        outcome?.ok === true
+          ? outcome.value
+          : outcome?.ok === false
+            ? outcome.error.partialObservation
+            : undefined;
+      if (primary === undefined) {
+        if (partialObservation !== undefined)
+          cleanup.retainPartialObservation(partialObservation);
+        return err(bindCdpTransportCleanup(cleanupFailure, cleanup));
+      }
+      const composed = analysisErrorWithCleanupFailure(
+        primary,
+        cleanup,
+        "observe_javascript_runtime",
+      );
+      return err(bindCdpTransportCleanup(cleanupFailure, composed));
     }
     return (
       outcome ??
@@ -194,48 +521,6 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
   }
 }
 
-export const closeInspectorConnection = async (
-  connection: Pick<CdpConnection, "close">,
-  signal?: AbortSignal,
-): Promise<void> => {
-  const closing = connection.close();
-  // best-effort cleanup: the race below observes the close; this only prevents
-  // unhandled rejection when the caller abandons the close via cancellation.
-  void closing.catch(() => undefined);
-  // CdpConnection.close has its own one second transport bound. Do not make a
-  // cancelled caller wait for that fallback.
-  if (signal === undefined) return await closing;
-  let onAbort: (() => void) | undefined;
-  const cancelled = new Promise<void>((resolve) => {
-    onAbort = () => resolve();
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) onAbort();
-  });
-  try {
-    await Promise.race([closing, cancelled]);
-  } finally {
-    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
-  }
-};
-
-export const inspectorCleanupError = (
-  primaryFailure: unknown,
-  cleanupFailure: unknown,
-  hasPrimaryFailure: boolean,
-): BrowserObservationError => {
-  const cause = hasPrimaryFailure
-    ? new AggregateError(
-        [primaryFailure, cleanupFailure],
-        "Inspector observation and cleanup both failed",
-      )
-    : cleanupFailure;
-  return new BrowserObservationError(
-    "observe_javascript_runtime",
-    "cleanup_failed",
-    { cause },
-  );
-};
-
 const projectTarget = (target: AuthorizedV8InspectorTarget) => ({
   target_id: target.id,
   protocol_type: target.type,
@@ -244,30 +529,71 @@ const projectTarget = (target: AuthorizedV8InspectorTarget) => ({
 });
 
 const authorizedTarget = async (
-  targets: readonly V8InspectorTarget[],
+  discovery: V8InspectorDiscovery,
   input: ObserveJavaScriptRuntimeInput,
-  product: string,
+  asarHeaderAdmission: AsarHeaderAdmission,
+  signal?: AbortSignal,
+  files?: ElectronFileScope,
 ): Promise<AuthorizedV8InspectorTarget> => {
-  const target = targets.find(({ id }) => id === input.target_id);
+  throwIfRuntimeObservationCancelled(signal);
+  const target = selectCdpDiscoveryTarget(
+    discovery.targets,
+    input.target_id,
+    "observe_javascript_runtime",
+    discovery.ambiguousTargetIds,
+  );
   if (target === undefined)
     throw new BrowserObservationError(
       "observe_javascript_runtime",
       "target_not_found",
     );
-  const decision = await authorizeRuntimeTargetLocation(target.url, {
-    type: target.type,
-    product,
-  });
-  if (
-    target.attached ||
-    !decision.allowed ||
-    decision.location.kind === "builtin"
-  )
+  const decision = await authorizeRuntimeTargetLocation(
+    target.url,
+    { type: target.type, product: discovery.runtime.product },
+    signal,
+    "observe_javascript_runtime",
+    asarHeaderAdmission,
+    files,
+  );
+  throwIfRuntimeObservationCancelled(signal);
+  if (target.attached === true)
     throw new BrowserObservationError(
       "observe_javascript_runtime",
       "target_not_allowed",
+      {
+        detail: `Inspector target ${target.id} reports attached: true; REA will not displace its debugger.`,
+        diagnostics: { target_id: target.id, attached: true },
+        remediationAction:
+          "Disconnect the other debugger or select an unattached target, refresh list_javascript_runtime_targets, and retry with its exact target ID.",
+      },
     );
-  return { ...target, location: decision.location };
+  if (!decision.allowed || decision.location.kind === "builtin")
+    throw new BrowserObservationError(
+      "observe_javascript_runtime",
+      "target_not_allowed",
+      {
+        detail: `Inspector target ${target.id} has no supported observable target location.`,
+        remediationAction:
+          "Select a target with a supported file or HTTP(S) location from list_javascript_runtime_targets.",
+      },
+    );
+  if (target.webSocketUrl === null)
+    throw new BrowserObservationError(
+      "observe_javascript_runtime",
+      "invalid_endpoint_response",
+      {
+        detail:
+          "The selected Inspector target has no validated direct WebSocket endpoint.",
+      },
+    );
+  return {
+    id: target.id,
+    type: target.type,
+    url: target.url,
+    attached: target.attached,
+    webSocketUrl: target.webSocketUrl,
+    location: decision.location,
+  };
 };
 
 const assertRuntimeKind = (
@@ -282,27 +608,36 @@ const assertRuntimeKind = (
     throw new BrowserObservationError(
       "observe_javascript_runtime",
       "target_not_allowed",
+      {
+        detail: `Declared runtime_kind ${String(kind)} is incompatible with Inspector target ${target.id} protocol type ${target.type}.`,
+        diagnostics: {
+          target_id: target.id,
+          protocol_type: target.type,
+          runtime_kind: kind ?? null,
+        },
+        remediationAction:
+          "Correct runtime_kind to match the selected target's protocol type (node for Node or Electron main, page for Electron renderer or preload), or omit runtime_kind to retain an unknown role. The declared role is not authenticated by Inspector.",
+      },
     );
 };
 
 const emptyCaptureState = (): CaptureState => ({
   scripts: [],
   contexts: new Map(),
+  latestContexts: new Map(),
   eventsObserved: 0,
   eventsRetained: 0,
   eventsDropped: 0,
   metadataBytes: 0,
   scriptsObserved: 0,
   invalidScripts: 0,
+  parseFailedScripts: 0,
+  invalidContexts: 0,
   truncated: false,
   truncationReasons: new Set(),
 });
 
-const ingestEvent = (
-  event: CdpEvent,
-  input: ObserveJavaScriptRuntimeInput,
-  state: CaptureState,
-): void => {
+const ingestEvent = (event: CdpEvent, state: CaptureState): void => {
   if (
     event.method !== "Debugger.scriptParsed" &&
     event.method !== "Debugger.scriptFailedToParse" &&
@@ -313,86 +648,113 @@ const ingestEvent = (
     return;
   state.eventsObserved += 1;
   if (event.method === "Debugger.scriptParsed") {
-    ingestScript(event, input, state);
+    ingestScript(event, state);
     return;
   }
   if (event.method === "Debugger.scriptFailedToParse") {
-    state.invalidScripts += 1;
+    const facts = readCdpScriptParsed(event.params);
+    if (facts.scriptId === undefined || facts.url === undefined) {
+      state.invalidScripts += 1;
+      retainEvent(state, 0);
+      return;
+    }
+    state.parseFailedScripts += 1;
     retainEvent(state, 0);
     return;
   }
-  ingestContext(event, input, state);
+  ingestContext(event, state);
 };
 
-const ingestScript = (
-  event: CdpEvent,
-  input: ObserveJavaScriptRuntimeInput,
-  state: CaptureState,
-): void => {
+const ingestScript = (event: CdpEvent, state: CaptureState): void => {
   state.scriptsObserved += 1;
-  const value = recordValue(event.params);
-  const rawUrl = cdpStringValue(value?.url);
-  if (rawUrl === undefined || rawUrl === "") {
+  const facts = readCdpScriptParsed(event.params);
+  const rawUrl = facts.url;
+  if (rawUrl === undefined) {
     state.invalidScripts += 1;
     retainEvent(state, 0);
     return;
   }
+  const { metadata } = facts;
+  const context =
+    facts.contextKey === null
+      ? undefined
+      : state.latestContexts.get(facts.contextKey);
   const draft: ScriptDraft = {
     rawUrl,
-    executionContextKey: contextKey(value?.executionContextId),
-    cdpHash: cdpStringValue(value?.hash) ?? null,
-    length: nonnegativeInteger(value?.length),
-    isModule: value?.isModule === true,
+    executionContextKey:
+      context?.state === "created" ? context.contextKey : null,
+    executionContextId:
+      facts.contextKey === null ? null : (facts.contextId ?? null),
+    cdpHash: metadata.hash,
+    length: metadata.length,
+    isModule: metadata.isModule,
   };
-  const bytes = metadataBytes(draft);
-  retainEvent(state, bytes);
+  const bytes = retainedMetadataBytes(draft);
+  if (!retainEvent(state, bytes)) return;
   state.scripts.push(draft);
 };
 
-const ingestContext = (
-  event: CdpEvent,
-  input: ObserveJavaScriptRuntimeInput,
-  state: CaptureState,
-): void => {
+const ingestContext = (event: CdpEvent, state: CaptureState): void => {
   if (event.method === "Runtime.executionContextsCleared") {
-    for (const context of state.contexts.values()) context.state = "cleared";
+    for (const context of state.latestContexts.values()) {
+      if (context.state === "created") context.state = "cleared";
+    }
+    state.latestContexts.clear();
     retainEvent(state, 0);
     return;
   }
-  const parameters = recordValue(event.params);
-  const runtimeContext =
-    event.method === "Runtime.executionContextCreated"
-      ? recordValue(parameters?.context)
-      : parameters;
-  const key = contextKey(
-    event.method === "Runtime.executionContextCreated"
-      ? runtimeContext?.id
-      : runtimeContext?.executionContextId,
-  );
-  if (key === null) {
+  const created = event.method === "Runtime.executionContextCreated";
+  const createdContext = created
+    ? readCdpExecutionContextCreated(event.params)
+    : undefined;
+  const identity =
+    createdContext ?? readCdpExecutionContextDestroyed(event.params);
+  const key = identity.contextKey;
+  if (key === null || identity.id === undefined) {
+    state.invalidContexts += 1;
     retainEvent(state, 0);
     return;
   }
-  const origin =
-    event.method === "Runtime.executionContextCreated"
-      ? (cdpStringValue(runtimeContext?.origin) ?? null)
-      : null;
+  const previous = state.latestContexts.get(key);
+  // A lifecycle transition invalidates the old binding even if the new
+  // record cannot be retained within the metadata budget.
+  state.latestContexts.delete(key);
+  if (!created && previous !== undefined) {
+    previous.state = "destroyed";
+    state.latestContexts.set(key, previous);
+    retainEvent(state, 0);
+    return;
+  }
   const draft: ContextDraft = {
-    contextKey: key,
-    state:
-      event.method === "Runtime.executionContextCreated"
-        ? "created"
-        : "destroyed",
-    origin: origin === "" ? null : origin,
+    contextKey: `context_${String(state.contexts.size)}`,
+    executionContextId: identity.id,
+    state: created ? "created" : "destroyed",
+    name: createdContext?.name ?? null,
+    origin: createdContext?.origin ?? null,
   };
-  const bytes = metadataBytes(draft);
-  retainEvent(state, bytes);
-  state.contexts.set(key, draft);
+  if (!retainEvent(state, retainedMetadataBytes(draft))) return;
+  state.contexts.set(draft.contextKey, draft);
+  state.latestContexts.set(key, draft);
 };
 
-const retainEvent = (state: CaptureState, bytes: number): void => {
-  state.metadataBytes += bytes;
+const retainEvent = (state: CaptureState, bytes: number): boolean => {
+  if (!replaceRetainedMetadata(state, bytes)) return false;
   state.eventsRetained += 1;
+  return true;
+};
+
+const replaceRetainedMetadata = (
+  state: CaptureState,
+  byteDelta: number,
+): boolean => {
+  if (state.metadataBytes + byteDelta > INSPECTOR_MAX_RETAINED_METADATA_BYTES) {
+    state.eventsDropped += 1;
+    state.truncated = true;
+    state.truncationReasons.add("retained_metadata_budget_exceeded");
+    return false;
+  }
+  state.metadataBytes += byteDelta;
+  return true;
 };
 
 const waitForCapture = async (
@@ -401,49 +763,63 @@ const waitForCapture = async (
   signal?: AbortSignal,
 ): Promise<void> => {
   let removeDisconnect = (): void => undefined;
+  let removeProtocolFailure = (): void => undefined;
   const disconnected = new Promise<never>((_resolve, reject) => {
-    removeDisconnect = connection.onDisconnect(() =>
-      reject(
-        new BrowserObservationError(
-          "observe_javascript_runtime",
-          "disconnected",
-        ),
-      ),
+    removeDisconnect = connection.onDisconnect((error) => reject(error));
+  });
+  const protocolFailure = new Promise<never>((_resolve, reject) => {
+    removeProtocolFailure = connection.onProtocolFailure((error) =>
+      reject(error),
     );
   });
+  const timerOwner = new AbortController();
+  const timerSignal =
+    signal === undefined
+      ? timerOwner.signal
+      : AbortSignal.any([signal, timerOwner.signal]);
   try {
     await Promise.race([
       delayWithCancellation(
         observationMs,
         "observe_javascript_runtime",
-        signal,
+        timerSignal,
       ),
       disconnected,
+      protocolFailure,
     ]);
   } finally {
+    // Cancel only this wait's timer. The caller owns and retains its signal.
+    timerOwner.abort();
     removeDisconnect();
+    removeProtocolFailure();
   }
 };
 
-const metadataBytes = (value: object): number =>
-  Buffer.byteLength(JSON.stringify(value));
-
-const nonnegativeInteger = (value: unknown): number => {
-  const parsed = numberValue(value);
-  return parsed === undefined ? 0 : Math.max(0, Math.trunc(parsed));
-};
-
-const contextKey = (value: unknown): string | null => {
-  const identifier = numberValue(value);
-  return identifier !== undefined && Number.isSafeInteger(identifier)
-    ? String(identifier)
-    : null;
+const retainedMetadataBytes = (value: ScriptDraft | ContextDraft): number => {
+  const strings =
+    "rawUrl" in value
+      ? [value.rawUrl, value.rawUrl, value.executionContextKey, value.cdpHash]
+      : [value.contextKey, value.name, value.origin];
+  return (
+    RETAINED_OBJECT_OVERHEAD_BYTES +
+    strings.reduce((total, text) => total + (text?.length ?? 0) * 2, 0)
+  );
 };
 
 const providerError = (
   cause: unknown,
   operation: BrowserObservationOperation,
 ): AnalysisError => {
+  const fileFailure =
+    operation === "observe_javascript_runtime" ||
+    operation === "list_javascript_runtime_targets"
+      ? mapElectronFileAuthorizationFailure(
+          cause,
+          V8_INSPECTOR_PROVIDER_IDENTITY.id,
+          operation,
+        )
+      : undefined;
+  if (fileFailure !== undefined) return fileFailure;
   if (cause instanceof AnalysisError) return cause;
   return new ProviderAdapterError(
     V8_INSPECTOR_PROVIDER_IDENTITY.id,

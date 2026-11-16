@@ -1,9 +1,19 @@
+import { InvalidResidualUnknownGraphError } from "./residualUnknownGraphError.js";
+import { withEvidenceSubjectDeclaration } from "./evidenceSubject.js";
+import { digestSchema } from "./digests.js";
+import { EvidenceIntegrityError } from "./evidenceErrors.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
+import { err, ok, type Result } from "./result.js";
+import { describeValidationFailure } from "./validationFailure.js";
+import { equalJsonText } from "./jsonSerialization.js";
 import { z } from "zod";
 import canonicalize from "canonicalize";
 
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+
 import {
-  evidenceEnvelopeSchema,
-  evidenceRecordSchema,
+  evidenceSchema,
+  immutableEvidence,
   parseEvidence,
   providerSchema,
   type Evidence,
@@ -12,38 +22,83 @@ import {
   residualUnknownSchema,
   type ResidualUnknown,
 } from "./residualUnknown.js";
+import { freezeJsonSnapshot } from "./immutableJson.js";
 
-const artifactManifestSchema = evidenceEnvelopeSchema.shape.subject
-  .unwrap()
-  .pick({
-    digest: true,
-    format: true,
-    architecture: true,
-  });
+const artifactManifestBaseSchema = z.strictObject({
+  digest: z.strictObject({ sha256: digestSchema }),
+});
+const artifactManifestSchema = withEvidenceSubjectDeclaration(
+  artifactManifestBaseSchema,
+);
 const providerManifestSchema = providerSchema;
-const environmentManifestSchema =
-  evidenceEnvelopeSchema.shape.environment.unwrap();
-const scenarioManifestSchema = z.object({
-  evidence_id: evidenceEnvelopeSchema.shape.evidence_id,
+const environmentManifestSchema = evidenceSchema.shape.environment.unwrap();
+const scenarioManifestSchema = z.strictObject({
+  evidence_id: evidenceSchema.shape.evidence_id,
   operation: z.string().min(1),
   authority: z.literal("controlled-replay"),
 });
-const captureManifestSchema = z.object({
-  evidence_id: evidenceEnvelopeSchema.shape.evidence_id,
+const captureManifestSchema = z.strictObject({
+  evidence_id: evidenceSchema.shape.evidence_id,
   predicate_type: z.string().min(1),
 });
 
-export const evidenceBundleSchema = z.object({
+export const evidenceBundleSchema = z.strictObject({
   artifacts: z.array(artifactManifestSchema),
   providers: z.array(providerManifestSchema),
   environments: z.array(environmentManifestSchema),
   scenarios: z.array(scenarioManifestSchema),
   captures: z.array(captureManifestSchema),
   unknowns: z.array(residualUnknownSchema),
-  records: z.array(evidenceRecordSchema),
+  records: z.array(evidenceSchema),
 });
 
 export type EvidenceBundle = z.infer<typeof evidenceBundleSchema>;
+const immutableBundles = new WeakMap<object, EvidenceBundle>();
+
+/** Recognize an authenticated sealed bundle without traversing or copying it. */
+export const isImmutableEvidenceBundle = (
+  input: unknown,
+): input is EvidenceBundle =>
+  typeof input === "object" && input !== null && immutableBundles.has(input);
+
+/** Caller input has valid shape but is not in authenticated canonical form. */
+class NonCanonicalEvidenceBundleError extends TypeError {
+  /** The top-level sections whose content differs from canonical form. */
+  constructor(readonly sections: readonly string[]) {
+    super(`Evidence bundle sections are not canonical: ${sections.join(", ")}`);
+    this.name = "NonCanonicalEvidenceBundleError";
+  }
+}
+
+/** Caller input lists the same Evidence record more than once. */
+class DuplicateEvidenceRecordError extends TypeError {
+  constructor() {
+    super("Evidence bundle contains duplicate record IDs");
+    this.name = "DuplicateEvidenceRecordError";
+  }
+}
+
+/** Build and authenticate a sealed bundle while reusing immutable Evidence records. */
+export const createImmutableEvidenceBundle = (
+  records: readonly Evidence[],
+  unknowns: readonly ResidualUnknown[] = [],
+): EvidenceBundle => {
+  const checkedRecords = records.map(immutableEvidence);
+  if (
+    new Set(checkedRecords.map(({ evidence_id }) => evidence_id)).size !==
+    checkedRecords.length
+  )
+    throw new DuplicateEvidenceRecordError();
+  const checkedUnknowns = unknowns.map((unknown) =>
+    residualUnknownSchema.parse(unknown),
+  );
+  validateUnknownGraph(checkedUnknowns, checkedRecords);
+  const bundle = freezeJsonSnapshot(
+    createEvidenceBundle(checkedRecords, checkedUnknowns),
+  );
+  immutableBundles.set(bundle, bundle);
+  return bundle;
+};
 
 /** Project records into a deterministic bundle whose order has no semantics. */
 export const createEvidenceBundle = (
@@ -51,7 +106,7 @@ export const createEvidenceBundle = (
   unknowns: readonly ResidualUnknown[] = [],
 ): EvidenceBundle => {
   const sortedRecords = [...records].sort((left, right) =>
-    left.evidence_id.localeCompare(right.evidence_id),
+    compareUnicodeCodePoints(left.evidence_id, right.evidence_id),
   );
   return {
     artifacts: uniqueSorted(
@@ -59,11 +114,11 @@ export const createEvidenceBundle = (
         subject === null
           ? []
           : [
-              {
+              artifactManifestSchema.parse({
                 digest: subject.digest,
                 format: subject.format,
                 architecture: subject.architecture,
-              },
+              }),
             ],
       ),
     ),
@@ -96,14 +151,14 @@ export const createEvidenceBundle = (
     ),
     unknowns: [...unknowns].sort(
       (left, right) =>
-        left.unknown_id.localeCompare(right.unknown_id) ||
+        compareUnicodeCodePoints(left.unknown_id, right.unknown_id) ||
         left.revision - right.revision,
     ),
     records: sortedRecords,
   };
 };
 
-/** Restrict a bundle to records and complete unknown histories for one artifact. */
+/** Retain target records, their linked sources, and eligible complete unknown histories. */
 export const evidenceBundleForTarget = (
   bundle: EvidenceBundle,
   sha256: string,
@@ -111,90 +166,254 @@ export const evidenceBundleForTarget = (
   const recordsById = new Map(
     bundle.records.map((record) => [record.evidence_id, record]),
   );
-  const candidates = bundle.unknowns.filter(
-    ({ scope_digest: scopeDigest }) => scopeDigest === sha256,
-  );
-  const retained = new Set<ResidualUnknown>();
-  const revisionsById = new Map<string, number>();
-  const dependents = new Map<string, Set<ResidualUnknown>>();
-  for (const unknown of candidates) {
-    const mutationEvidenceIds = new Set(unknown.mutation_evidence_ids);
-    const evidenceAvailable = referencedEvidenceIds(unknown).every((id) => {
-      const record = recordsById.get(id);
-      return (
-        record?.subject?.digest.sha256 === sha256 ||
-        (mutationEvidenceIds.has(id) &&
-          record?.subject === null &&
-          record.predicate_type === "rea.residual-unknown-mutation")
-      );
+  const histories = new Map<string, ResidualUnknown[]>();
+  for (const unknown of bundle.unknowns) {
+    const history = histories.get(unknown.unknown_id) ?? [];
+    history.push(unknown);
+    histories.set(unknown.unknown_id, history);
+  }
+  const retained = new Set<string>();
+  const dependents = new Map<string, Set<string>>();
+  const relationships = new Map<string, Set<string>>();
+  for (const [id, history] of histories) {
+    const eligible = history.every((unknown) => {
+      if (unknown.scope_digest !== sha256) return false;
+      const mutationEvidenceIds = new Set(unknown.mutation_evidence_ids);
+      return referencedEvidenceIds(unknown).every((evidenceId) => {
+        const record = recordsById.get(evidenceId);
+        // Mutation subjects record the target active at the time of an edit,
+        // which need not be the question's immutable investigation scope.
+        return (
+          record?.subject?.digest.sha256 === sha256 ||
+          (mutationEvidenceIds.has(evidenceId) &&
+            record?.predicate_type === "rea.residual-unknown-mutation")
+        );
+      });
     });
-    if (!evidenceAvailable) continue;
-    retained.add(unknown);
-    revisionsById.set(
-      unknown.unknown_id,
-      (revisionsById.get(unknown.unknown_id) ?? 0) + 1,
+    if (!eligible) continue;
+    retained.add(id);
+    const relatedIds = new Set(
+      history.flatMap((unknown) =>
+        unknown.relationships.map(({ unknown_id }) => unknown_id),
+      ),
     );
-    for (const relatedId of new Set(
-      unknown.relationships.map(({ unknown_id: id }) => id),
-    )) {
-      const references =
-        dependents.get(relatedId) ?? new Set<ResidualUnknown>();
-      references.add(unknown);
+    relationships.set(id, relatedIds);
+    for (const relatedId of relatedIds) {
+      const references = dependents.get(relatedId) ?? new Set<string>();
+      references.add(id);
       dependents.set(relatedId, references);
     }
   }
-  const pending: ResidualUnknown[] = [];
-  for (const unknown of retained)
-    if (
-      unknown.relationships.some(({ unknown_id: id }) => !revisionsById.has(id))
-    )
-      pending.push(unknown);
+  const pending: string[] = [];
+  for (const [id, relatedIds] of relationships)
+    if ([...relatedIds].some((relatedId) => !retained.has(relatedId)))
+      pending.push(id);
   for (let index = 0; index < pending.length; index += 1) {
-    const unknown = pending[index];
-    if (unknown === undefined || !retained.delete(unknown)) continue;
-    const remaining = (revisionsById.get(unknown.unknown_id) ?? 1) - 1;
-    if (remaining > 0) {
-      revisionsById.set(unknown.unknown_id, remaining);
-      continue;
-    }
-    revisionsById.delete(unknown.unknown_id);
-    for (const dependent of dependents.get(unknown.unknown_id) ?? [])
-      pending.push(dependent);
+    const id = pending[index];
+    if (id === undefined || !retained.delete(id)) continue;
+    for (const dependent of dependents.get(id) ?? []) pending.push(dependent);
   }
-  const unknowns = candidates.filter((unknown) => retained.has(unknown));
+  const unknowns = bundle.unknowns.filter((unknown) =>
+    retained.has(unknown.unknown_id),
+  );
   const mutationIds = new Set(
     unknowns.flatMap(({ mutation_evidence_ids: ids }) => ids),
   );
+  const selectedIds = new Set(
+    bundle.records
+      .filter(
+        (record) =>
+          record.subject?.digest.sha256 === sha256 ||
+          mutationIds.has(record.evidence_id),
+      )
+      .map((record) => record.evidence_id),
+  );
+  // Source Evidence may have no subject or describe a different artifact.
+  // Follow only explicit links from selected records, retaining missing links
+  // as missing rather than inventing or importing unrelated observations.
+  const pendingEvidence = [...selectedIds];
+  for (let index = 0; index < pendingEvidence.length; index += 1) {
+    const record = recordsById.get(pendingEvidence[index] ?? "");
+    for (const id of record?.evidence_links ?? []) {
+      if (!selectedIds.has(id) && recordsById.has(id)) {
+        selectedIds.add(id);
+        pendingEvidence.push(id);
+      }
+    }
+  }
   return createEvidenceBundle(
-    bundle.records.filter(
-      (record) =>
-        record.subject?.digest.sha256 === sha256 ||
-        mutationIds.has(record.evidence_id),
-    ),
+    bundle.records.filter((record) => selectedIds.has(record.evidence_id)),
     unknowns,
   );
 };
 
-const referencedEvidenceIds = (unknown: ResidualUnknown): readonly string[] => [
+export const referencedEvidenceIds = (
+  unknown: ResidualUnknown,
+): readonly string[] => [
   ...unknown.supporting_evidence_ids,
   ...unknown.contradicting_evidence_ids,
   ...unknown.mutation_evidence_ids,
   ...(unknown.resolution?.evidence_ids ?? []),
 ];
 
+type EvidenceBundleValidationFailure =
+  | z.ZodError
+  | DuplicateEvidenceRecordError
+  | InvalidResidualUnknownGraphError
+  | NonCanonicalEvidenceBundleError;
+
+/** Expected source rejection, including authenticated standalone Evidence. */
+export type EvidenceBundleFailure = {
+  readonly kind: "single-record" | "invalid-bundle";
+  readonly message: string;
+  readonly cause: EvidenceBundleValidationFailure;
+};
+
+const describeEvidenceBundleFailure = (
+  input: unknown,
+  cause: EvidenceBundleValidationFailure,
+): EvidenceBundleFailure => {
+  try {
+    const record = parseEvidence(input);
+    return {
+      kind: "single-record",
+      cause,
+      message: `Expected an Evidence bundle with records and manifest arrays, but this JSON is one Evidence record (${record.evidence_id}). Export a session bundle with the MCP export_evidence_bundle tool and supply that file.`,
+    };
+  } catch (recordFailure: unknown) {
+    if (!(recordFailure instanceof z.ZodError)) throw recordFailure;
+    return {
+      kind: "invalid-bundle",
+      cause,
+      message:
+        cause instanceof z.ZodError
+          ? `Evidence bundle does not match the bundle schema ${describeValidationFailure(cause)}. Supply an unmodified bundle produced by this REA identity format. Recreate observations from earlier formats; re-exporting an old bundle does not update its identities.`
+          : `Evidence bundle validation failed: ${describeValidationFailure(cause)}. Recreate or re-export the bundle, then try again.`,
+    };
+  }
+};
+
 /** Parse records, verify semantic IDs, and reject inconsistent manifests. */
 export const parseEvidenceBundle = (input: unknown): EvidenceBundle => {
-  const parsed = evidenceBundleSchema.parse(input);
+  return parseBundle(input, false);
+};
+
+/** Authenticate and seal snapshot-owned payloads, throwing validation failures. */
+export const parseImmutableEvidenceBundle = (input: unknown): EvidenceBundle =>
+  parseBundle(input, true);
+
+/** Read expected source failures as facts; implementation failures still throw. */
+export const safeParseEvidenceBundle = (
+  input: unknown,
+): Result<EvidenceBundle, EvidenceBundleFailure> => readBundle(input, false);
+
+/** Authenticate and seal file-owned payloads once for downstream zero-copy reuse. */
+export const safeParseImmutableEvidenceBundle = (
+  input: unknown,
+): Result<EvidenceBundle, EvidenceBundleFailure> => readBundle(input, true);
+
+const parseBundle = (input: unknown, seal: boolean): EvidenceBundle => {
+  if (typeof input === "object" && input !== null) {
+    const owned = immutableBundles.get(input);
+    if (owned !== undefined) return owned;
+  }
+  return authenticateBundle(evidenceBundleSchema.parse(input), seal);
+};
+
+/** Read a source bundle while preserving unexpected implementation failures. */
+export const readEvidenceBundle = (
+  input: unknown,
+  context: {
+    readonly operation: string;
+    readonly path: readonly (string | number)[];
+  },
+): Result<EvidenceBundle, AnalysisInputError | EvidenceIntegrityError> => {
+  const parsed = safeParseEvidenceBundle(input);
+  if (parsed.ok) return parsed;
+  const { cause, kind, message } = parsed.error;
+  if (kind === "single-record")
+    return err(
+      new AnalysisInputError(
+        context.operation,
+        { cause, userMessage: message, remediationAction: message },
+        [{ path: context.path, reason: "invalid_value", message }],
+      ),
+    );
+  return err(
+    new EvidenceIntegrityError(cause.message, {
+      cause,
+      userMessage: message,
+    }),
+  );
+};
+
+const readBundle = (
+  input: unknown,
+  seal: boolean,
+): Result<EvidenceBundle, EvidenceBundleFailure> => {
+  try {
+    return ok(
+      seal ? parseImmutableEvidenceBundle(input) : parseEvidenceBundle(input),
+    );
+  } catch (cause: unknown) {
+    if (
+      !(cause instanceof z.ZodError) &&
+      !(cause instanceof DuplicateEvidenceRecordError) &&
+      !(cause instanceof InvalidResidualUnknownGraphError) &&
+      !(cause instanceof NonCanonicalEvidenceBundleError)
+    )
+      throw cause;
+    return err(describeEvidenceBundleFailure(input, cause));
+  }
+};
+
+/** Authenticate evidence and bundle invariants after the bundle shape is parsed. */
+export const authenticateParsedEvidenceBundle = (
+  parsed: EvidenceBundle,
+): EvidenceBundle => authenticateBundle(parsed, false);
+
+const authenticateBundle = (
+  parsed: EvidenceBundle,
+  seal: boolean,
+): EvidenceBundle => {
   const recordIds = parsed.records.map(({ evidence_id: id }) => id);
   if (new Set(recordIds).size !== recordIds.length)
-    throw new TypeError("Evidence bundle contains duplicate record IDs");
+    throw new DuplicateEvidenceRecordError();
   validateUnknownGraph(parsed.unknowns, parsed.records);
   const canonical = createEvidenceBundle(
-    parsed.records.map(parseEvidence),
+    parsed.records.map((record, index) => {
+      try {
+        if (!seal) return parseEvidence(record);
+        // Schema parsing gave this boundary exclusive ownership. Register only
+        // validated payloads before authenticating the complete record envelope.
+        record.normalized_result = freezeJsonSnapshot(record.normalized_result);
+        record.raw_result = freezeJsonSnapshot(record.raw_result);
+        return immutableEvidence(record);
+      } catch (cause: unknown) {
+        if (cause instanceof z.ZodError)
+          throw new z.ZodError(
+            cause.issues.map((issue) => ({
+              ...issue,
+              path: ["records", index, ...issue.path],
+            })),
+          );
+        throw cause;
+      }
+    }),
     parsed.unknowns,
   );
-  if (JSON.stringify(parsed) !== JSON.stringify(canonical))
-    throw new TypeError("Evidence bundle manifests are not canonical");
+  if (!equalJsonText(parsed, canonical))
+    // Name only the sections that differ, so an unchanged section is not
+    // blamed for another section's ordering or content.
+    throw new NonCanonicalEvidenceBundleError(
+      (Object.keys(canonical) as (keyof EvidenceBundle)[]).filter(
+        (section) => !equalJsonText(parsed[section], canonical[section]),
+      ),
+    );
+  if (seal) {
+    freezeJsonSnapshot(canonical);
+    immutableBundles.set(canonical, canonical);
+  }
   return canonical;
 };
 
@@ -218,15 +437,19 @@ const validateUnknownGraph = (
     );
     for (const [index, revision] of history.entries()) {
       if (revision.revision !== index + 1)
-        throw new TypeError(
-          `Residual unknown ${id} revision history has a gap`,
-        );
+        throw new InvalidResidualUnknownGraphError({
+          kind: "history_gap",
+          unknown_id: id,
+        });
       if (
         index > 0 &&
         revision.previous_revision_digest !==
           history[index - 1]?.revision_digest
       )
-        throw new TypeError(`Residual unknown ${id} revision chain is broken`);
+        throw new InvalidResidualUnknownGraphError({
+          kind: "revision_chain",
+          unknown_id: id,
+        });
     }
     const head = history.at(-1);
     if (head === undefined)
@@ -234,22 +457,20 @@ const validateUnknownGraph = (
     unknownById.set(id, head);
   }
   for (const unknown of unknowns) {
-    const referencedEvidence = [
-      ...unknown.supporting_evidence_ids,
-      ...unknown.contradicting_evidence_ids,
-      ...unknown.mutation_evidence_ids,
-      ...(unknown.resolution?.evidence_ids ?? []),
-    ];
-    for (const evidenceId of referencedEvidence)
+    for (const evidenceId of referencedEvidenceIds(unknown))
       if (!evidenceById.has(evidenceId))
-        throw new TypeError(
-          `Residual unknown references missing evidence ${evidenceId}`,
-        );
+        throw new InvalidResidualUnknownGraphError({
+          kind: "missing_evidence",
+          unknown_id: unknown.unknown_id,
+          evidence_id: evidenceId,
+        });
     for (const relationship of unknown.relationships)
       if (!unknownById.has(relationship.unknown_id))
-        throw new TypeError(
-          `Residual unknown references missing unknown ${relationship.unknown_id}`,
-        );
+        throw new InvalidResidualUnknownGraphError({
+          kind: "missing_unknown",
+          unknown_id: unknown.unknown_id,
+          related_unknown_id: relationship.unknown_id,
+        });
     if (unknown.resolution?.disposition === "verified")
       validateVerifiedResolution(unknown, evidenceById);
   }
@@ -261,9 +482,10 @@ const validateVerifiedResolution = (
   evidenceById: Pick<ReadonlyMap<string, Evidence>, "get">,
 ): void => {
   if (unknown.contradicting_evidence_ids.length > 0)
-    throw new TypeError(
-      `Residual unknown ${unknown.unknown_id} retains contradicting evidence`,
-    );
+    throw new InvalidResidualUnknownGraphError({
+      kind: "contradicting_evidence",
+      unknown_id: unknown.unknown_id,
+    });
   const qualifies = unknown.resolution?.evidence_ids.some((evidenceId) => {
     const evidence = evidenceById.get(evidenceId);
     return (
@@ -274,9 +496,10 @@ const validateVerifiedResolution = (
     );
   });
   if (qualifies !== true)
-    throw new TypeError(
-      `Residual unknown ${unknown.unknown_id} has no qualifying resolution evidence`,
-    );
+    throw new InvalidResidualUnknownGraphError({
+      kind: "resolution_unproven",
+      unknown_id: unknown.unknown_id,
+    });
 };
 
 /**
@@ -296,22 +519,27 @@ export const validateResidualUnknownAddition = (
       : unknown.revision !== current.revision + 1 ||
         unknown.previous_revision_digest !== current.revision_digest
   )
-    throw new TypeError(
-      `Residual unknown ${unknown.unknown_id} revision chain is broken`,
-    );
+    throw new InvalidResidualUnknownGraphError({
+      kind: "revision_chain",
+      unknown_id: unknown.unknown_id,
+    });
   for (const evidenceId of referencedEvidenceIds(unknown))
     if (!evidenceById.has(evidenceId))
-      throw new TypeError(
-        `Residual unknown references missing evidence ${evidenceId}`,
-      );
+      throw new InvalidResidualUnknownGraphError({
+        kind: "missing_evidence",
+        unknown_id: unknown.unknown_id,
+        evidence_id: evidenceId,
+      });
   for (const relationship of unknown.relationships)
     if (
       relationship.unknown_id !== unknown.unknown_id &&
       !currentHeads.has(relationship.unknown_id)
     )
-      throw new TypeError(
-        `Residual unknown references missing unknown ${relationship.unknown_id}`,
-      );
+      throw new InvalidResidualUnknownGraphError({
+        kind: "missing_unknown",
+        unknown_id: unknown.unknown_id,
+        related_unknown_id: relationship.unknown_id,
+      });
   if (unknown.resolution?.disposition === "verified")
     validateVerifiedResolution(unknown, evidenceById);
   // In a valid graph, no existing node can point to an absent ID. Since the
@@ -325,7 +553,10 @@ export const validateResidualUnknownAddition = (
       dependencies.length > 0 &&
       reachesUnknown(dependencies, unknown.unknown_id, currentHeads, unknown)
     )
-      throw new TypeError("Residual unknown dependency graph contains a cycle");
+      throw new InvalidResidualUnknownGraphError({
+        kind: "dependency_cycle",
+        unknown_id: unknown.unknown_id,
+      });
   }
 };
 
@@ -413,9 +644,10 @@ const rejectDependencyCycles = (
         if (relationship?.type !== "depends-on") continue;
         const dependency = relationship.unknown_id;
         if (active.has(dependency))
-          throw new TypeError(
-            "Residual unknown dependency graph contains a cycle",
-          );
+          throw new InvalidResidualUnknownGraphError({
+            kind: "dependency_cycle",
+            unknown_id: dependency,
+          });
         if (visited.has(dependency)) continue;
         const unknown = unknownById.get(dependency);
         if (unknown === undefined)
@@ -451,6 +683,6 @@ const uniqueSorted = <Value>(values: readonly Value[]): Value[] => {
   const unique = new Map<string, Value>();
   for (const value of values) unique.set(JSON.stringify(value), value);
   return [...unique.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
     .map(([, value]) => value);
 };

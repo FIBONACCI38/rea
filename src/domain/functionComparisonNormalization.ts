@@ -1,16 +1,21 @@
+import { hasStableNativeSymbol } from "./native/nativeSymbol.js";
 import { canonicalJson } from "./comparisonSemantics.js";
-import { compareCodePoints } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import {
+  nativeAddressCoordinateInputSchema,
+  nativeAddressInputSchema,
+} from "./native/nativeAddress.js";
 
 import type {
-  FunctionCollection,
+  FunctionSnapshotCoordinateContext,
   FunctionSnapshot,
 } from "./functionDossierEvidence.js";
 import type { FunctionComparisonResult } from "./functionComparisonSchemas.js";
 
 export const identityProjection = (snapshot: FunctionSnapshot) => ({
-  name: snapshot.procedure.name,
-  signature: snapshot.procedure.signature,
-  locals: snapshot.procedure.locals
+  name: snapshot.dossier.procedure.name,
+  signature: snapshot.dossier.procedure.signature,
+  locals: snapshot.dossier.procedure.locals
     .map(({ description }) => description)
     .sort(),
 });
@@ -18,39 +23,90 @@ export const identityProjection = (snapshot: FunctionSnapshot) => ({
 export const functionMatch = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
+  coordinateContext: FunctionSnapshotCoordinateContext,
 ): FunctionComparisonResult["function_match"] => {
-  if (
-    !isAutoName(left.procedure.name) &&
-    left.procedure.name === right.procedure.name
-  )
+  const leftName = left.dossier.procedure.name;
+  const rightName = right.dossier.procedure.name;
+  if (coordinateContext === "common") {
+    const leftEntry = nativeAddressInputSchema.safeParse(
+      left.dossier.procedure.address,
+    );
+    const rightEntry = nativeAddressInputSchema.safeParse(
+      right.dossier.procedure.address,
+    );
+    if (leftEntry.success && rightEntry.success)
+      return leftEntry.data === rightEntry.data
+        ? {
+            status: "matched",
+            method: "same-entry",
+            entry_address: leftEntry.data,
+            left_name: leftName,
+            right_name: rightName,
+          }
+        : {
+            status: "mismatched",
+            method: "explicit",
+            left_name: leftName,
+            right_name: rightName,
+          };
+  }
+  if (left.evidence.evidence_id === right.evidence.evidence_id)
+    return {
+      status: "matched",
+      method: "same-evidence",
+      left_name: leftName,
+      right_name: rightName,
+    };
+  if (coordinateContext === "common")
+    return {
+      status: "ambiguous",
+      method: "explicit",
+      left_name: leftName,
+      right_name: rightName,
+    };
+  const stableNames =
+    hasStableNativeSymbol(leftName, left.dossier.procedure.symbol) &&
+    hasStableNativeSymbol(rightName, right.dossier.procedure.symbol);
+  if (stableNames && leftName === rightName)
     return {
       status: "matched",
       method: "symbol",
-      left_name: left.procedure.name,
-      right_name: right.procedure.name,
+      left_name: leftName,
+      right_name: rightName,
     };
   return {
     status:
-      left.procedure.name === right.procedure.name ? "ambiguous" : "mismatched",
+      stableNames && coordinateContext === "cross-artifact"
+        ? "mismatched"
+        : "ambiguous",
     method: "explicit",
-    left_name: left.procedure.name,
-    right_name: right.procedure.name,
+    left_name: leftName,
+    right_name: rightName,
   };
 };
 
 export const normalizeCfg = (
-  blocks: FunctionSnapshot["collections"]["basic_blocks"]["items"],
+  blocks: FunctionSnapshot["dossier"]["basic_blocks"],
 ): readonly unknown[] | null => {
   const parsed: {
     block: (typeof blocks)[number];
     start: bigint;
     end: bigint;
   }[] = [];
+  let space: string | null | undefined;
   for (const block of blocks) {
     const start = parseAddress(block.start);
     const end = parseAddress(block.end);
-    if (start === null || end === null || end <= start) return null;
-    parsed.push({ block, start, end });
+    if (
+      start === null ||
+      end === null ||
+      start.space !== end.space ||
+      (space !== undefined && start.space !== space) ||
+      end.offset <= start.offset
+    )
+      return null;
+    space = start.space;
+    parsed.push({ block, start: start.offset, end: end.offset });
   }
   const ordered = parsed.sort((left, right) =>
     left.start < right.start ? -1 : left.start > right.start ? 1 : 0,
@@ -63,8 +119,8 @@ export const normalizeCfg = (
     const successors: number[] = [];
     for (const address of block.successors) {
       const parsedAddress = parseAddress(address);
-      if (parsedAddress === null) return null;
-      const index = indices.get(parsedAddress);
+      if (parsedAddress === null || parsedAddress.space !== space) return null;
+      const index = indices.get(parsedAddress.offset);
       if (index === undefined) return null;
       successors.push(index);
     }
@@ -76,98 +132,72 @@ export const normalizeCfg = (
   return graph;
 };
 
-export const referenceProjection = (snapshot: FunctionSnapshot) =>
-  sorted([
-    ...snapshot.collections.incoming_references.items.map((item) => ({
-      direction: "in",
-      source: item.source_procedure?.name ?? null,
-      target: item.target_procedure?.name ?? null,
-    })),
-    ...snapshot.collections.outgoing_references.items.map((item) => ({
-      direction: "out",
-      source: item.source_procedure?.name ?? null,
-      target: item.target_procedure?.name ?? null,
-    })),
-  ]);
-
-export const referenceKindProjection = (
-  snapshot: FunctionSnapshot,
-): readonly unknown[] | null => {
-  const edges = [
-    ...snapshot.collections.incoming_references.items.map((edge) => ({
-      direction: "in",
-      edge,
-    })),
-    ...snapshot.collections.outgoing_references.items.map((edge) => ({
-      direction: "out",
-      edge,
-    })),
-  ];
-  if (edges.some(({ edge }) => !edge.kind.available)) return null;
-  return sorted(
-    edges.map(({ direction, edge }) => {
-      if (!edge.kind.available)
-        throw new TypeError(
-          "Reference-kind availability changed during projection",
-        );
-      return {
-        direction,
-        source: edge.source_procedure?.name ?? null,
-        target: edge.target_procedure?.name ?? null,
-        type: edge.kind.type,
-        flow: edge.kind.flow,
-        call: edge.kind.call,
-        jump: edge.kind.jump,
-        data: edge.kind.data,
-        read: edge.kind.read,
-        write: edge.kind.write,
-        indirect: edge.kind.indirect,
-        computed: edge.kind.computed,
-        conditional: edge.kind.conditional,
-        terminal: edge.kind.terminal,
-        primary: edge.kind.primary,
-        operand_index: edge.kind.operand_index,
-        external: edge.kind.external,
-      };
-    }),
-  );
-};
-
 export const commentProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
-  const values = snapshot.collections.comments.items.map(
-    ({ address, kind, text }) => ({
-      offset: relativeAddress(address, snapshot.procedure.address),
-      kind,
-      text,
-    }),
-  );
+  const values = snapshot.dossier.comments.map(({ address, kind, text }) => ({
+    offset: relativeAddress(address, snapshot.dossier.procedure.address),
+    kind,
+    text,
+  }));
   return values.some(({ offset }) => offset === null) ? null : sorted(values);
 };
 
-export const stringAndNameProjection = (
+export const referencedStringProjection = (snapshot: FunctionSnapshot) => {
+  const values = snapshot.dossier.referenced_strings.map(
+    ({ source_address: sourceAddress, value, decoding, string }) => ({
+      source_offset: relativeAddress(
+        sourceAddress,
+        snapshot.dossier.procedure.address,
+      ),
+      content: decoding === undefined ? value : null,
+      decoding_reason: decoding?.reason ?? null,
+      metadata:
+        string === undefined
+          ? null
+          : {
+              encoding: string.encoding,
+              termination: string.termination,
+              byte_length: string.byte_length,
+            },
+    }),
+  );
+  return sorted(values);
+};
+
+export const nameAndSwiftProjection = (
   snapshot: FunctionSnapshot,
+  includeSwiftLiterals = true,
 ): readonly unknown[] | null => {
   const values = [
-    ...snapshot.collections.referenced_strings.items.map(
-      ({ source_address: sourceAddress, value }) => ({
-        kind: "string",
-        source_offset: relativeAddress(
-          sourceAddress,
-          snapshot.procedure.address,
-        ),
-        value,
-      }),
-    ),
-    ...snapshot.collections.referenced_names.items.map(
+    ...snapshot.dossier.referenced_names.map(
       ({ source_address: sourceAddress, value }) => ({
         kind: "name",
         source_offset: relativeAddress(
           sourceAddress,
-          snapshot.procedure.address,
+          snapshot.dossier.procedure.address,
         ),
         value,
+      }),
+    ),
+    ...(includeSwiftLiterals
+      ? (snapshot.dossier.swift_string_literals ?? [])
+      : []
+    ).map(
+      ({
+        source_address: sourceAddress,
+        value,
+        representation,
+        registers,
+      }) => ({
+        kind: "swift_string",
+        source_offset: relativeAddress(
+          sourceAddress,
+          snapshot.dossier.procedure.address,
+        ),
+        value,
+        representation,
+        registers,
       }),
     ),
   ];
@@ -176,48 +206,92 @@ export const stringAndNameProjection = (
     : sorted(values);
 };
 
-export const sorted = (values: readonly unknown[]): readonly unknown[] =>
+/**
+ * A retained literal proves presence, not that every path through its site was examined.
+ * A differing retained fact proves a change only when the opposite dossier is complete
+ * and therefore establishes its absence.
+ */
+export const swiftLiteralSitesConflict = (
+  left: FunctionSnapshot,
+  right: FunctionSnapshot,
+): boolean => {
+  const leftSites = swiftLiteralSites(left);
+  const rightSites = swiftLiteralSites(right);
+  for (const site of new Set([
+    ...leftSites.values.keys(),
+    ...rightSites.values.keys(),
+  ])) {
+    const leftValues =
+      leftSites.values.get(site) ?? (leftSites.complete ? [] : undefined);
+    const rightValues =
+      rightSites.values.get(site) ?? (rightSites.complete ? [] : undefined);
+    if (leftValues === undefined || rightValues === undefined) continue;
+    const leftFacts = new Set(leftValues);
+    const rightFacts = new Set(rightValues);
+    if (
+      (rightSites.complete &&
+        leftValues.some((value) => !rightFacts.has(value))) ||
+      (leftSites.complete && rightValues.some((value) => !leftFacts.has(value)))
+    )
+      return true;
+  }
+  return false;
+};
+
+/** Omitted literal inventory differs from an observed empty inventory. */
+export const swiftLiteralCoverage = (
+  snapshot: FunctionSnapshot,
+): "absent" | "complete" | "partial" =>
+  (snapshot.dossier.swift_string_literal_omissions ?? []).length > 0
+    ? "partial"
+    : snapshot.dossier.swift_string_literals === undefined
+      ? "absent"
+      : "complete";
+
+const swiftLiteralSites = (snapshot: FunctionSnapshot) => {
+  const base = snapshot.dossier.procedure.address;
+  const site = (sourceAddress: string, registers: readonly string[]) => {
+    const offset = relativeAddress(sourceAddress, base);
+    return offset === null ? null : canonicalJson([offset, registers]);
+  };
+  // Keep the same literal facts the full strings_names projection compares.
+  const values = new Map<string, string[]>();
+  for (const literal of snapshot.dossier.swift_string_literals ?? []) {
+    const key = site(literal.source_address, literal.registers);
+    if (key === null) continue;
+    values.set(
+      key,
+      [
+        ...(values.get(key) ?? []),
+        canonicalJson([literal.value, literal.representation]),
+      ].sort(compareUnicodeCodePoints),
+    );
+  }
+  const complete = swiftLiteralCoverage(snapshot) === "complete";
+  return { values, complete };
+};
+
+export const sorted = <T>(values: readonly T[]): readonly T[] =>
   values
     .map((value) => ({
       value,
       json: canonicalJson(value, "Function normalization"),
     }))
-    .sort((left, right) => {
-      // Preserve existing collation while ordering distinct values within a tie.
-      return (
-        left.json.localeCompare(right.json) ||
-        compareCodePoints(left.json, right.json)
-      );
-    })
+    .sort((left, right) => compareUnicodeCodePoints(left.json, right.json))
     .map(({ value }) => value);
 
-export const combineCoverage = <Item>(
-  left: FunctionCollection<Item>,
-  right: FunctionCollection<Item>,
-): FunctionCollection<Item> => {
-  return {
-    items: [...left.items, ...right.items],
-    total: left.total + right.total,
-    complete: true,
-    truncated: false,
-  };
+const parseAddress = (value: string) => {
+  const parsed = nativeAddressCoordinateInputSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 };
-
-export const project = <Input, Output>(
-  collection: FunctionCollection<Input>,
-  mapper: (item: Input) => Output,
-): Output[] => collection.items.map(mapper);
-
-export const isAutoName = (name: string): boolean =>
-  /^(?:sub_[0-9a-f]+|fcn\.[0-9a-f]+)$/iu.test(name);
-
-const parseAddress = (value: string): bigint | null =>
-  /^0x[0-9a-f]+$/iu.test(value) ? BigInt(value) : null;
 
 const relativeAddress = (value: string, base: string): string | null => {
   const parsed = parseAddress(value);
   const parsedBase = parseAddress(base);
-  return parsed === null || parsedBase === null || parsed < parsedBase
+  return parsed === null ||
+    parsedBase === null ||
+    parsed.space !== parsedBase.space ||
+    parsed.offset < parsedBase.offset
     ? null
-    : String(parsed - parsedBase);
+    : String(parsed.offset - parsedBase.offset);
 };

@@ -2,10 +2,11 @@ import {
   createJavaScriptApplicationEdge,
   createJavaScriptApplicationGraph,
   createJavaScriptApplicationNode,
-  type ApplicationGraphEvidence,
-  type ApplicationNode,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
+import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "./javascriptApplicationEvidenceSchemas.js";
+import { resolveJavaScriptSourceMapReferences } from "./javascriptSourceMapPaths.js";
 
 export const APPLICATION_GRAPH_DIGESTS = {
   package: "1".repeat(64),
@@ -22,6 +23,20 @@ export const completeCoverage = {
   limits: [],
 } satisfies ApplicationGraphEvidence["coverage"];
 
+export const sourceMapReference = (
+  sourceName: string,
+  sourceRoot: string | null,
+  mapPath: string,
+) => {
+  const reference = resolveJavaScriptSourceMapReferences(
+    [sourceName],
+    sourceRoot,
+    mapPath,
+  )[0];
+  if (reference == null) throw new TypeError("Expected a source-map reference");
+  return reference;
+};
+
 const extractor = (operation: string) => ({
   name: "rea-test-fixture",
   version: "1.0.0",
@@ -35,6 +50,7 @@ export const artifactEvidence = (
   authority:
     | "artifact-bytes"
     | "ast-static-analysis"
+    | "managed-static-analysis"
     | "native-analysis-provider" = "artifact-bytes",
 ): ApplicationGraphEvidence => ({
   authority,
@@ -95,7 +111,7 @@ export const runtimeEvidence = (
   extractor: extractor("observe-passive-cdp"),
   coverage: completeCoverage,
   limitations: ["Only passive CDP metadata was observed."],
-  evidence_ids: [],
+  evidence_ids: [`ev_${"c".repeat(64)}`],
 });
 
 type FixtureNode = ReturnType<typeof createJavaScriptApplicationNode>;
@@ -109,7 +125,7 @@ type FixtureNodeArguments = [
   evidence: ApplicationGraphEvidence,
 ];
 
-const fixtureNode = (
+export const fixtureNode = (
   ...[kind, identity, label, properties, evidence]: FixtureNodeArguments
 ): FixtureNode =>
   createJavaScriptApplicationNode({
@@ -239,7 +255,11 @@ const buildNativeRuntimeNodes = (): FixtureNode[] => [
       key: "openProject",
     },
     "openProject",
-    { calling_convention: "napi" },
+    {
+      calling_convention: "napi",
+      specifier: "native/synthetic.node",
+      members: ["openProject"],
+    },
     artifactEvidence(
       APPLICATION_GRAPH_DIGESTS.nativeAddon,
       "native/synthetic.node",
@@ -251,6 +271,7 @@ const buildNativeRuntimeNodes = (): FixtureNode[] => [
     {
       strategy: "runtime-instance",
       stability: "capture-only",
+      capture_evidence_id: `ev_${"c".repeat(64)}`,
       capture_sha256: APPLICATION_GRAPH_DIGESTS.capture,
       runtime_key: "script-preload",
     },

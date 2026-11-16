@@ -1,15 +1,16 @@
 import {
   createJavaScriptApplicationGraph,
-  createJavaScriptApplicationNode,
-  type ApplicationEdge,
-  type ApplicationNode,
+  mergeJavaScriptApplicationNodes,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
 import type {
-  ParsedRuntimeCapture,
-  ParsedStaticLayer,
-} from "./javascriptRuntimeReconciliationParsing.js";
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
+  ApplicationEdge,
+  ApplicationNode,
+} from "./javascriptApplicationGraphSchemas.js";
+import type { ParsedStaticLayer } from "./javascriptRuntimeReconciliationParsing.js";
+import type { ParsedRuntimeCapture } from "./javascriptRuntimeReconciliationCaptureParsing.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { RuntimeProjection } from "./javascriptRuntimeReconciliationRuntime.js";
 
 interface ReconciledGraphInput {
@@ -38,7 +39,7 @@ export interface ReconciledApplicationGraphProjection {
 export const buildReconciledApplicationGraph = (
   input: ReconciledGraphInput,
 ): ReconciledApplicationGraphProjection => {
-  const merged = mergeNodes([
+  const merged = mergeJavaScriptApplicationNodes([
     ...input.layers.flatMap(({ graph }) => graph.nodes),
     ...input.runtime.nodes,
   ]);
@@ -91,12 +92,14 @@ const boundGraphContent = (
   const allRoots = preferredRootIds(input);
   const rootNodeIds = allRoots;
   const sortedNodes = [...nodes].sort((left, right) =>
-    compareCodePoints(left.node_id, right.node_id),
+    compareUnicodeCodePoints(left.node_id, right.node_id),
   );
   const retainedNodes = sortedNodes;
   const retainedIds = new Set(retainedNodes.map(({ node_id: id }) => id));
   const retainedEdges = [...edges]
-    .sort((left, right) => compareCodePoints(left.edge_id, right.edge_id))
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.edge_id, right.edge_id),
+    )
     .filter(
       ({ source_node_id: source, target_node_id: target }) =>
         retainedIds.has(source) && retainedIds.has(target),
@@ -134,7 +137,9 @@ const graphCoverageFacts = (
     inspection.completeness.conditions.includes("truncated"),
   );
   const captureHasUnknownOmissions = input.captures.some(
-    ({ inspection }) => inspection.completeness.unavailable_sections.length > 0,
+    ({ inspection }) =>
+      inspection.completeness.attach_limited_sections.length > 0 ||
+      inspection.completeness.unavailable_sections.length > 0,
   );
   const inputTruncated =
     input.layers.some(({ graph }) => graph.coverage.truncated) ||
@@ -206,42 +211,6 @@ const graphCoverage = (
           omitted_count: facts.omissionsKnown ? facts.knownOmissions : null,
           limits: [],
         };
-
-const mergeNodes = (nodes: readonly ApplicationNode[]): ApplicationNode[] => {
-  const grouped = new Map<string, ApplicationNode[]>();
-  for (const node of nodes)
-    grouped.set(node.node_id, [...(grouped.get(node.node_id) ?? []), node]);
-  const merged = [...grouped.values()].map((group) => {
-    const first = group[0];
-    if (first === undefined) throw new TypeError("Empty JAG node group");
-    if (
-      group.some(
-        ({ kind, identity }) =>
-          kind !== first.kind ||
-          JSON.stringify(identity) !== JSON.stringify(first.identity),
-      )
-    )
-      throw new TypeError("Colliding JAG node identifiers disagree");
-    const observations = [
-      ...new Map(
-        group
-          .flatMap(({ observations: values }) => values)
-          .map((observation) => [observation.observation_id, observation]),
-      ).values(),
-    ].sort((left, right) =>
-      compareCodePoints(left.observation_id, right.observation_id),
-    );
-    return createJavaScriptApplicationNode({
-      kind: first.kind,
-      identity: first.identity,
-      observations: observations.map(
-        ({ observation_id: _id, identifier_strategy: _strategy, ...value }) =>
-          value,
-      ),
-    });
-  });
-  return merged;
-};
 
 const uniqueEdges = (edges: readonly ApplicationEdge[]): ApplicationEdge[] => [
   ...new Map(edges.map((edge) => [edge.edge_id, edge])).values(),

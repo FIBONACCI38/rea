@@ -1,17 +1,23 @@
 import { z } from "zod";
 import { digestSchema } from "../digests.js";
 import { analyzeJavaScriptApplicationInputSchema } from "./javascriptApplicationAnalysis.js";
+import { absoluteLocalPathStringSchema } from "../localPath.js";
 
-/** Recover derived readable modules from one explicitly selected local script. */
+/** Recover derived readable modules from explicitly selected local scripts. */
 export const javascriptRecoveryInputSchema = z.strictObject({
-  path: z
-    .string()
-    .min(1)
-    .describe("Absolute path to a UTF-8 JavaScript file; never executed"),
-  output_directory: z
-    .string()
-    .min(1)
-    .describe("Absolute absent output directory; parent must exist"),
+  path: absoluteLocalPathStringSchema.describe(
+    "Absolute path to a UTF-8 JavaScript file; never executed",
+  ),
+  additional_paths: z
+    .array(absoluteLocalPathStringSchema)
+    .max(16)
+    .optional()
+    .describe(
+      "Additional absolute UTF-8 JavaScript files recovered together with path; each is snapshotted separately so imports can resolve across related chunks. All inputs share a 64 MiB total budget",
+    ),
+  output_directory: absoluteLocalPathStringSchema.describe(
+    "Absolute absent output directory; parent must exist",
+  ),
   extraction_mode: z
     .enum(["structural", "heuristic", "inspection"])
     .default("structural")
@@ -29,20 +35,23 @@ export const javascriptRecoveryInputSchema = z.strictObject({
 const fileSchema = z.strictObject({
   path: z.string().min(1),
   sha256: digestSchema,
-  bytes: z.number().int().nonnegative(),
+  bytes: z.int().nonnegative(),
 });
 
 const rangeSchema = z.strictObject({
-  start: z.number().int().nonnegative(),
-  end: z.number().int().nonnegative(),
+  start: z.int().nonnegative(),
+  end: z.int().nonnegative(),
+});
+
+const sourceSchema = fileSchema.extend({
+  snapshot_path: z.string().min(1),
+  published_copy: fileSchema,
 });
 
 /** Complete published artifacts and exact producer provenance for source recovery. */
 export const javascriptRecoveryResultSchema = z.strictObject({
-  source: fileSchema.extend({
-    snapshot_path: z.string().min(1),
-    published_copy: fileSchema,
-  }),
+  source: sourceSchema,
+  additional_sources: z.array(sourceSchema).optional(),
   engine: z.strictObject({
     id: z.string().min(1),
     version: z.string().min(1),
@@ -61,8 +70,8 @@ export const javascriptRecoveryResultSchema = z.strictObject({
   reported_safety: z.string(),
   reported_strategy: z.string(),
   reported_format: z.string(),
-  total: z.number().int().nonnegative(),
-  failed: z.number().int().nonnegative(),
+  total: z.int().nonnegative(),
+  failed: z.int().nonnegative(),
   modules: z.array(
     z.strictObject({
       reported_filename: z.string().min(1),
@@ -107,3 +116,9 @@ export type JavaScriptRecoveryInput = z.output<
 export type JavaScriptRecoveryResult = z.output<
   typeof javascriptRecoveryResultSchema
 >;
+
+/** Completed publication retained when cleanup fails after durable commit. */
+export interface JavaScriptRecoveryPartialObservation {
+  readonly kind: "javascript-recovery";
+  readonly result: JavaScriptRecoveryResult;
+}

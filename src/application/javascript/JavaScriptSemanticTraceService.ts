@@ -1,61 +1,78 @@
-import { z } from "zod";
-
+import type { ExecutionOptions } from "../AnalysisProvider.js";
 import {
-  AnalysisInputError,
-  AnalysisProtocolError,
-} from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
-import type { Evidence } from "../../domain/evidence.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
+  resolveEvidenceRequest,
+  type EvidenceLookup,
+} from "../EvidenceInputResolver.js";
+import { traceJavaScriptSemanticsRequestSchema } from "../../contracts/javascript/applicationWorkflowInputContracts.js";
+import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import {
+  applicationGraphEvidenceInputError,
+  applicationGraphSubjectTarget,
+  parseApplicationGraphEvidence,
+} from "./JavaScriptApplicationEvidenceGraph.js";
 import { queryJavaScriptSemanticGraph } from "../../domain/javascript/javascriptSemanticQuery.js";
-import {
-  javaScriptSemanticTraceResultSchema,
-  traceJavaScriptSemanticsInputSchema,
-} from "../../domain/javascript/javascriptSemanticTraceSchemas.js";
+import type { JavaScriptSemanticTraceResult } from "../../domain/javascript/javascriptSemanticTraceSchemas.js";
 import { err, ok, type Result } from "../../domain/result.js";
-import { parseApplicationGraphEvidence } from "./JavaScriptApplicationEvidenceGraph.js";
 import { createJavaScriptSemanticTraceEvidence } from "./JavaScriptApplicationWorkflowEvidence.js";
+import type { ApplicationWorkflowExecution } from "./JavaScriptApplicationWorkflowService.js";
 
 const OPERATION = "trace_javascript_semantics" as const;
 
-/** Trace semantic relations from input already parsed by a trusted adapter. */
-export const traceJavaScriptSemanticsEvidenceValidated = (
-  input: z.output<typeof traceJavaScriptSemanticsInputSchema>,
-): Result<Evidence, AnalysisError> => {
-  try {
-    const source = parseApplicationGraphEvidence(input.application);
-    if (source.semanticGraph === null)
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["application"],
-            reason: "invalid_value",
-            expected:
-              "inline Evidence from analyze_javascript_application with a semantic graph",
-          },
-        ]),
-      );
-    const query = queryJavaScriptSemanticGraph(
-      source.semanticGraph,
-      input.query,
-    );
-    const result = javaScriptSemanticTraceResultSchema.parse({
-      ...query,
-      source_evidence_id: source.evidence.evidence_id,
-      evidence_links: [source.evidence.evidence_id],
-    });
-    return ok(
-      createJavaScriptSemanticTraceEvidence(
-        {
-          application_evidence_id: source.evidence.evidence_id,
-          query: jsonValueSchema.parse(input.query),
-        },
-        result,
-      ),
-    );
-  } catch (cause: unknown) {
+/** Resolve and authenticate one application source before tracing semantic relations. */
+export const traceJavaScriptSemanticsEvidence = (
+  rawInput: unknown,
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<
+  ApplicationWorkflowExecution<JavaScriptSemanticTraceResult>,
+  AnalysisError
+> => {
+  const request = resolveEvidenceRequest(
+    OPERATION,
+    rawInput,
+    traceJavaScriptSemanticsRequestSchema,
+    lookup,
+    options,
+  );
+  if (!request.ok) return request;
+  const input = request.value.input;
+  const sourceResult = parseApplicationGraphEvidence(input.application, [
+    "application",
+  ]);
+  if (!sourceResult.ok)
     return err(
-      new AnalysisProtocolError("JavaScript semantic trace failed", { cause }),
+      applicationGraphEvidenceInputError(OPERATION, sourceResult.error),
     );
-  }
+  const source = sourceResult.value;
+  if (source.semanticGraph === null)
+    return err(
+      new AnalysisInputError(OPERATION, undefined, [
+        {
+          path: ["application"],
+          reason: "invalid_value",
+          expected:
+            "Evidence from analyze_javascript_application with a semantic graph",
+        },
+      ]),
+    );
+  const query = queryJavaScriptSemanticGraph(source.semanticGraph, input.query);
+  const result: JavaScriptSemanticTraceResult = {
+    ...query,
+    source_evidence_id: source.evidence.evidence_id,
+    evidence_links: [source.evidence.evidence_id],
+  };
+  const { allowed_relations, ...queryParameters } = input.query;
+  const evidence = createJavaScriptSemanticTraceEvidence(
+    applicationGraphSubjectTarget(source),
+    {
+      application_evidence_id: source.evidence.evidence_id,
+      query:
+        allowed_relations === undefined
+          ? queryParameters
+          : { ...queryParameters, allowed_relations },
+    },
+    result,
+  );
+  return ok({ evidence, result, sources: [source.evidence] });
 };

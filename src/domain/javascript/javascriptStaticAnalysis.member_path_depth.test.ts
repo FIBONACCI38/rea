@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 
 import { collectJavaScriptExports } from "./javascriptAstFingerprint.js";
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 
 const memberChain = ".next".repeat(12_000);
@@ -10,25 +10,39 @@ const ordinaryMemberChain = ".next".repeat(64);
 it("collects a 12,000-member CommonJS export path without recursion", () => {
   const file = parseJavaScriptSource(`exports${memberChain}.last = 1;`);
   if (file === null) throw new Error("Expected valid JavaScript");
-  expect(collectJavaScriptExports(file).values).toEqual([
-    `${"next.".repeat(12_000)}last`,
-  ]);
+  expect(collectJavaScriptExports(file).values).toEqual(["next"]);
 });
 
-it("preserves empty, dynamic, this, and private member path behavior", () => {
+it("preserves exact empty keys without inventing dynamic, this, or private exports", () => {
   const file = parseJavaScriptSource(`
     exports[""].value = 1;
     exports[""] = 0;
     exports[key].value = 2;
+    exports.nested = {};
+    exports.nested.child = 3;
+    exports["nested.child"] = 4;
     this.exports.ignored = 3;
     class Example { #private = 0; read() { this.#private = 1; } }
   `);
   if (file === null) throw new Error("Expected valid JavaScript");
   expect(collectJavaScriptExports(file).values).toEqual([
     "",
-    ".value",
-    "key.value",
+    "nested",
+    "nested.child",
   ]);
+});
+
+it("distinguishes the object literal prototype setter from own export keys", () => {
+  const prototypeSetter = parseJavaScriptSource(
+    "module.exports = { __proto__: {} };",
+  );
+  const ownKeys = parseJavaScriptSource(
+    'module.exports = { ["__proto__"]: 1, __proto__() {} };',
+  );
+  if (prototypeSetter === null || ownKeys === null)
+    throw new Error("Expected valid JavaScript");
+  expect(collectJavaScriptExports(prototypeSetter).values).toEqual([]);
+  expect(collectJavaScriptExports(ownKeys).values).toEqual(["__proto__"]);
 });
 
 it("keeps left-first and outer-member-first bundler runtime matches", () => {
@@ -62,3 +76,44 @@ it("recognizes a bundler runtime through nested member names", () => {
     modules: [expect.objectContaining({ exports: ["ok"] })],
   });
 });
+
+it.each(["1 as const", "1 satisfies number"])(
+  "keeps numeric bundle identities through erased syntax: %s",
+  (entry) => {
+    const analysis = analyzeJavaScriptStaticSource(`
+      globalThis.webpackChunkApp.push([[(${entry})], {
+        1: function(module, exports, req) { req((2 as const)); req.e((3 satisfies number)); },
+        2: function() {}
+      }, function(req) { req((${entry})); }]);
+    `);
+    expect(analysis.parse_error_count).toBe(0);
+    expect(analysis.bundler_registrations).toMatchObject([
+      {
+        chunk_keys: ["1"],
+        unknown_chunk_keys: 0,
+        entry_module_keys: ["1"],
+        unknown_entry_module_keys: 0,
+        async_chunk_keys: ["3"],
+        unknown_async_chunk_keys: 0,
+      },
+    ]);
+    expect(analysis.references).toContainEqual(
+      expect.objectContaining({
+        specifier: "2",
+        loader: "factory-loader",
+        module_key: "1",
+      }),
+    );
+  },
+);
+
+it.each(["0, {}", "[], modules"])(
+  "does not grant factory-loader authority to a rejected registration: %s",
+  (entry) => {
+    const analysis = analyzeJavaScriptStaticSource(`
+      globalThis.webpackChunkApp.push([${entry}, function(req) { req("electron"); }]);
+    `);
+    expect(analysis.bundler_registrations).toEqual([]);
+    expect(analysis.references).toEqual([]);
+  },
+);

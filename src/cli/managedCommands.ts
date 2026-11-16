@@ -1,24 +1,66 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 
 import { compareManagedMemberPaths } from "../application/managed/ManagedMemberComparisonService.js";
-import { verifyManagedNativeBoundariesEvidence } from "../application/managed/ManagedNativeVerificationService.js";
+import { executeManagedNativeBoundaries } from "../application/managed/ManagedNativeVerificationService.js";
 import { importManagedReconstructionEvidence } from "../application/managed/ManagedReconstructionService.js";
-import { runProviderAnalysis } from "../composition/directAnalysis.js";
+import type { DirectAnalysis } from "../composition/directAnalysis.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { MANAGED_STATIC_PROVIDER } from "../domain/investigationProviders.js";
+import { ok } from "../domain/result.js";
+import {
+  evidenceBundleOption,
+  runEvidenceInputCommand,
+} from "./evidenceInputCommand.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { registerProjectManagedApplicationGraph } from "./managedProjectGraphCommand.js";
+import { managedMembersInputSchema } from "../contracts/managed/managedToolContracts.js";
+import { managedReconstructionImportRequestSchema } from "../domain/managed/managedReconstruction.js";
+import { managedNativeVerificationRequestSchema } from "../domain/managed/managedNativeVerificationSchemas.js";
+import { getEvidenceInputContract } from "../domain/evidenceInputContract.js";
+import { jsonInputArgument } from "./jsonInputArgument.js";
+import { localPathStringSchema } from "../domain/localPath.js";
+import { withCommandCancellation } from "./commandCancellation.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
+import { managedInspectionBudgetShape } from "../domain/managed/managedInspectionLimits.js";
+import { cliDecimalField } from "./options.js";
+
+const managedBudgetOptions = {
+  maxSnapshotBytes: cliDecimalField(
+    managedInspectionBudgetShape.max_snapshot_bytes,
+  ),
+  maxMetadataRepresentationBytes: cliDecimalField(
+    managedInspectionBudgetShape.max_metadata_representation_bytes,
+  ),
+};
+
+const managedBudgetParameters = (options: {
+  readonly maxSnapshotBytes?: number | undefined;
+  readonly maxMetadataRepresentationBytes?: number | undefined;
+}) => ({
+  ...(options.maxSnapshotBytes === undefined
+    ? {}
+    : { max_snapshot_bytes: options.maxSnapshotBytes }),
+  ...(options.maxMetadataRepresentationBytes === undefined
+    ? {}
+    : {
+        max_metadata_representation_bytes:
+          options.maxMetadataRepresentationBytes,
+      }),
+});
 
 export const registerManagedCommands = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
-  registerInspectManagedArtifact(cli, logger);
-  registerInspectManagedMembers(cli, logger);
-  registerInspectManagedNativeBoundaries(cli, logger);
+  registerInspectManagedArtifact(cli, logger, runProviderAnalysis);
+  registerInspectManagedMembers(cli, logger, runProviderAnalysis);
+  registerInspectManagedNativeBoundaries(cli, logger, runProviderAnalysis);
   registerCompareManagedMembers(cli, logger);
   registerImportManagedReconstruction(cli, logger);
   registerVerifyManagedNativeBoundaries(cli, logger);
@@ -28,15 +70,24 @@ export const registerManagedCommands = (
 const registerInspectManagedArtifact = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedArtifact, {
     description: "Inspect PE/CLI identity without loading target code",
     args: z.object({
-      path: z.string().describe("Managed PE executable or assembly path"),
+      path: localPathStringSchema.describe(
+        "Managed PE executable or assembly path",
+      ),
     }),
-    run: ({ args }) =>
+    options: z.object(managedBudgetOptions),
+    run: ({ args, options }) =>
       logCliCommand(logger, "inspect-managed-artifact", () =>
-        runProviderAnalysis(args.path, "inspect_managed_artifact", {}, logger),
+        runProviderAnalysis(
+          args.path,
+          "inspect_managed_artifact",
+          managedBudgetParameters(options),
+          logger,
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -44,16 +95,54 @@ const registerInspectManagedArtifact = (
 const registerInspectManagedMembers = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedMembers, {
     description:
-      "Inspect PE/CLI metadata members, signatures, and CIL anchors without loading target code",
+      "Inspect PE/CLI metadata members, signatures, CIL anchors, and ldstr string literals without loading target code",
     args: z.object({
-      path: z.string().describe("Managed PE executable or assembly path"),
+      path: localPathStringSchema.describe(
+        "Managed PE executable or assembly path",
+      ),
     }),
-    run: ({ args }) =>
-      logCliCommand(logger, "inspect-managed-members", () =>
-        runProviderAnalysis(args.path, "inspect_managed_members", {}, logger),
+    options: z.object({
+      ...managedBudgetOptions,
+      type: managedMembersInputSchema.shape.type_names.describe(
+        "Inspect only members declared by this exact type full name, and the string literals they load, such as System.Threading.Monitor; a nested type is named by its bare name, which selects every nested type of that name (repeatable)",
+      ),
+      detail: managedMembersInputSchema.shape.detail.describe(
+        "complete returns full Evidence (default); summary returns identity, selection, coverage, limitations and collection counts and requires --evidence-bundle",
+      ),
+      evidenceBundle: localPathStringSchema
+        .optional()
+        .describe(
+          "Write complete parent Evidence to a new local bundle for later inspect-analysis-view calls; never replaces an existing path",
+        ),
+    }),
+    run: ({ args, options }) =>
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "inspect-managed-members", () =>
+          runProviderAnalysis(
+            args.path,
+            "inspect_managed_members",
+            {
+              ...managedBudgetParameters(options),
+              ...(options.type === undefined
+                ? {}
+                : { type_names: options.type }),
+            },
+            logger,
+            signal,
+            {
+              ...(options.detail === undefined
+                ? {}
+                : { detail: options.detail }),
+              ...(options.evidenceBundle === undefined
+                ? {}
+                : { evidenceBundlePath: options.evidenceBundle }),
+            },
+          ).then(projectCliAnalysisResult),
+        ),
       ),
   });
 };
@@ -61,28 +150,36 @@ const registerInspectManagedMembers = (
 const registerInspectManagedNativeBoundaries = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedNativeBoundaries, {
     description:
       "Inspect PE/CLI PInvoke and native implementation boundary declarations without loading target code",
     args: z.object({
-      path: z.string().describe("Managed PE executable or assembly path"),
+      path: localPathStringSchema.describe(
+        "Managed PE executable or assembly path",
+      ),
     }),
-    run: ({ args }) =>
+    options: z.object(managedBudgetOptions),
+    run: ({ args, options }) =>
       logCliCommand(logger, "inspect-managed-native-boundaries", () =>
         runProviderAnalysis(
           args.path,
           "inspect_managed_native_boundaries",
-          {},
+          managedBudgetParameters(options),
           logger,
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
 
 const compareManagedMemberArgs = z.object({
-  leftPath: z.string().describe("Baseline managed PE executable or assembly"),
-  rightPath: z.string().describe("Candidate managed PE executable or assembly"),
+  leftPath: localPathStringSchema.describe(
+    "Baseline managed PE executable or assembly",
+  ),
+  rightPath: localPathStringSchema.describe(
+    "Candidate managed PE executable or assembly",
+  ),
 });
 
 const registerCompareManagedMembers = (
@@ -93,19 +190,49 @@ const registerCompareManagedMembers = (
     description:
       "Compare managed PE/CLI member inventories by exact declared type, name, and signature; names alone never form a match",
     args: compareManagedMemberArgs,
-    run: ({ args }) =>
-      logCliCommand(logger, "compare-managed-members", async () => {
-        const result = await compareManagedMemberPaths({
-          leftPath: args.leftPath,
-          rightPath: args.rightPath,
-        });
-        return result.ok
-          ? result.value
-          : {
-              error: "Managed member comparison failed",
-              ...projectAnalysisError(result.error),
-            };
-      }),
+    options: z.object({
+      ...managedBudgetOptions,
+      type: managedMembersInputSchema.shape.type_names.describe(
+        "Compare only members declared by this exact type full name on both sides, as selected by inspect-managed-members --type; use it when a whole-assembly comparison exceeds capacity (repeatable)",
+      ),
+    }),
+    run: ({ args, options }) =>
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "compare-managed-members", async () => {
+          const resources = new ArtifactResourceScope();
+          const result = await finishAnalysisCommand(
+            () =>
+              compareManagedMemberPaths(
+                {
+                  leftPath: args.leftPath,
+                  rightPath: args.rightPath,
+                  ...(options.maxSnapshotBytes === undefined
+                    ? {}
+                    : { maxSnapshotBytes: options.maxSnapshotBytes }),
+                  ...(options.maxMetadataRepresentationBytes === undefined
+                    ? {}
+                    : {
+                        maxRepresentationBytes:
+                          options.maxMetadataRepresentationBytes,
+                      }),
+                  ...(options.type === undefined
+                    ? {}
+                    : { typeNames: options.type }),
+                },
+                {},
+                resources,
+              ),
+            resources,
+            MANAGED_STATIC_PROVIDER.id,
+            "compare_managed_members",
+            signal,
+            "Managed member comparison resources",
+          );
+          return result.ok
+            ? result.value
+            : { error: "Managed member comparison failed", ...result.error };
+        }),
+      ),
   });
 };
 
@@ -117,20 +244,35 @@ const registerImportManagedReconstruction = (
     description:
       "Import decompiler-produced managed reconstruction against exact static member evidence",
     args: z.object({
-      inputJson: z
-        .string()
-        .describe("Inline managed reconstruction JSON or JSON file path"),
+      inputJson: jsonInputArgument(
+        "Inline managed reconstruction JSON or JSON file path",
+        getEvidenceInputContract(managedReconstructionImportRequestSchema)
+          .frameSchema,
+      ),
     }),
-    run: ({ args }) =>
-      logCliCommand(logger, "import-managed-reconstruction", async () => {
-        const input = await parseCliJsonInput(
-          args.inputJson,
-          "import-managed-reconstruction",
-        );
-        if (!input.ok) return input.error;
-        const result = importManagedReconstructionEvidence(input.value);
-        return result.ok ? result.value : projectAnalysisError(result.error);
-      }),
+    options: z.object({ evidenceBundle: evidenceBundleOption }),
+    run: ({ args, options }) =>
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "import-managed-reconstruction", async () => {
+          const input = await parseCliJsonInput(
+            args.inputJson,
+            "import-managed-reconstruction",
+            signal,
+          );
+          if (!input.ok) return input.error;
+          return runEvidenceInputCommand(
+            "import_managed_reconstruction",
+            options.evidenceBundle,
+            signal,
+            (lookup) =>
+              Promise.resolve(
+                importManagedReconstructionEvidence(input.value, lookup, {
+                  signal,
+                }),
+              ),
+          ).then(projectCliAnalysisResult);
+        }),
+      ),
   });
 };
 
@@ -142,19 +284,38 @@ const registerVerifyManagedNativeBoundaries = (
     description:
       "Verify managed P/Invoke declarations against authenticated native Evidence",
     args: z.object({
-      inputJson: z
-        .string()
-        .describe("Inline managed/native verification JSON or JSON file path"),
+      inputJson: jsonInputArgument(
+        "Inline managed/native verification JSON or JSON file path",
+        getEvidenceInputContract(managedNativeVerificationRequestSchema)
+          .frameSchema,
+      ),
     }),
-    run: ({ args }) =>
-      logCliCommand(logger, "verify-managed-native-boundaries", async () => {
-        const input = await parseCliJsonInput(
-          args.inputJson,
-          "verify-managed-native-boundaries",
-        );
-        if (!input.ok) return input.error;
-        const result = verifyManagedNativeBoundariesEvidence(input.value);
-        return result.ok ? result.value : projectAnalysisError(result.error);
-      }),
+    options: z.object({ evidenceBundle: evidenceBundleOption }),
+    run: ({ args, options }) =>
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, "verify-managed-native-boundaries", async () => {
+          const input = await parseCliJsonInput(
+            args.inputJson,
+            "verify-managed-native-boundaries",
+            signal,
+          );
+          if (!input.ok) return input.error;
+          return runEvidenceInputCommand(
+            "verify_managed_native_boundaries",
+            options.evidenceBundle,
+            signal,
+            (lookup) => {
+              const result = executeManagedNativeBoundaries(
+                input.value,
+                lookup,
+                { signal },
+              );
+              return Promise.resolve(
+                result.ok ? ok(result.value.evidence) : result,
+              );
+            },
+          ).then(projectCliAnalysisResult);
+        }),
+      ),
   });
 };

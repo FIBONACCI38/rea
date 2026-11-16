@@ -1,22 +1,28 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { z } from "zod";
+import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
 
-import { PRODUCT_IDENTITY } from "../identity.js";
-import { isOwnedClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
-import { readClientRegistrationStatuses } from "./ClientRegistrationStatus.js";
 import {
-  effectiveClientServer,
-  parseClientConfiguration,
-} from "./ClientConfigurationDocument.js";
-import { supportedClients } from "./SupportedClients.js";
+  readClientRegistrationInspections,
+  type ClientRegistrationStatus,
+} from "./ClientRegistrationStatus.js";
+import {
+  existingSkillDestinations,
+  type SkillPathIssue,
+} from "./SetupSkill.js";
 import type { SetupAction } from "./SetupTypes.js";
 import type { Result } from "../domain/result.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 
 /** Existing REA integrations selected for maintenance, without discovering new targets. */
 export interface MaintenanceScope {
   readonly clients: readonly string[];
   readonly skill: boolean;
+  readonly unresolved?: readonly ClientRegistrationStatus[];
+  readonly skillIssues?: readonly SkillPathIssue[];
+  readonly skillDestinations?: readonly {
+    readonly client: string;
+    readonly path: string;
+  }[];
 }
 
 /** Unapplied maintenance evidence produced by the updated setup executable. */
@@ -28,7 +34,11 @@ export type IntegrationMaintenance =
       readonly command: readonly string[];
       readonly plannedActions: readonly SetupAction[];
     }
-  | { readonly status: "unavailable"; readonly remediation: string };
+  | {
+      readonly status: "unavailable";
+      readonly remediation: string;
+      readonly scope?: MaintenanceScope;
+    };
 
 const setupPlanSchema = z.object({
   status: z.literal("planned"),
@@ -47,59 +57,97 @@ const setupPlanSchema = z.object({
   ),
 });
 
-/** Discover owned registrations and an existing REA skill without writes. */
+/** Discover owned registrations and REA skills without writes. */
 export const existingMaintenanceScope = async (
   home: string,
   entryPoint: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
+  resources?: ArtifactResourceScope,
 ): Promise<MaintenanceScope> => {
-  const registrations = await readClientRegistrationStatuses(home, entryPoint);
-  const supported = supportedClients(home);
+  const registrations = await readClientRegistrationInspections(
+    home,
+    entryPoint,
+    {
+      environment,
+      // A registration REA wrote must be refreshed even when the product
+      // profile is absent, so maintenance reads ownership evidence instead of
+      // product applicability. Owned rows stay the only ones selected below.
+      evidence: "ownership",
+      ...(resources === undefined ? {} : { resources }),
+    },
+  );
   const clients: string[] = [];
-  for (const registration of registrations) {
+  const unresolved: ClientRegistrationStatus[] = [];
+  for (const { status: registration, activation } of registrations) {
+    if (registration.state === "unknown" || registration.state === "invalid") {
+      unresolved.push(registration);
+      continue;
+    }
     if (
+      activation !== "enabled" ||
       (registration.state !== "aligned" && registration.state !== "stale") ||
-      !isOwnedClientRegistrationCommand(registration.command, entryPoint)
+      registration.command_identity !== "owned"
     )
       continue;
-    const client = supported.find(({ name }) => name === registration.client);
-    if (client === undefined) continue;
-    const parsed = parseClientConfiguration(
-      await readFile(client.configPath, "utf8"),
-      client.format,
-    );
-    const enabled = z
-      .object({
-        enabled: z.boolean().optional(),
-        disabled: z.boolean().optional(),
-      })
-      .parse(effectiveClientServer(parsed, PRODUCT_IDENTITY.mcpServerKey));
-    if (enabled.enabled !== false && enabled.disabled !== true)
-      clients.push(client.name);
+    clients.push(registration.client);
   }
-  let skill = false;
-  try {
-    const content = await readFile(
-      join(home, ".agents", "skills", PRODUCT_IDENTITY.skillName, "SKILL.md"),
-      "utf8",
-    );
-    skill =
-      content.startsWith(`---\nname: ${PRODUCT_IDENTITY.skillName}\n`) ||
-      content.startsWith(`---\r\nname: ${PRODUCT_IDENTITY.skillName}\r\n`);
-  } catch (cause: unknown) {
-    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT"))
-      throw cause;
-  }
-  return { clients, skill };
+  // Each setup action rewrites only that client's own configuration path, so
+  // maintenance keeps every selected client instead of deferring one view of
+  // a registration to another client's inspection: ZCode writes
+  // ~/.zcode/cli/config.json and deliberately leaves the ~/.agents/mcp.json
+  // fallback untouched (docs/getting-started/client-configuration.md), while FreeBuff writes
+  // the shared file itself. Dropping FreeBuff because ZCode reads that
+  // fallback would leave the row both products load pinned to the old
+  // version.
+  const skills = await existingSkillDestinations(
+    home,
+    environment,
+    process.platform,
+    resources,
+  );
+  return {
+    clients,
+    skill: skills.destinations.length > 0,
+    skillDestinations: skills.destinations,
+    ...(skills.issues.length === 0 ? {} : { skillIssues: skills.issues }),
+    ...(unresolved.length === 0 ? {} : { unresolved }),
+  };
 };
 
 /** Ask the verified new executable to plan only existing REA integrations. */
 export const planIntegrationMaintenance = async (
   home: string,
   entryPoint: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
   execute: (command: readonly string[]) => Promise<Result<string, string>>,
+  resources?: ArtifactResourceScope,
 ): Promise<IntegrationMaintenance> => {
   try {
-    const scope = await existingMaintenanceScope(home, entryPoint);
+    const scope = await existingMaintenanceScope(
+      home,
+      entryPoint,
+      environment,
+      resources,
+    );
+    if (
+      (scope.unresolved?.length ?? 0) > 0 ||
+      (scope.skillIssues?.length ?? 0) > 0
+    )
+      return {
+        status: "unavailable",
+        scope,
+        remediation: `Integration maintenance is unresolved: ${[
+          ...(scope.unresolved ?? []).map(
+            ({ client, config_path, remediation }) =>
+              `${client} (${config_path}): ${remediation ?? "Registration identity is unresolved"}`,
+          ),
+          ...(scope.skillIssues ?? []).map(
+            ({ client, path, detail }) =>
+              `${client ?? "skill"} (${path}): ${detail}`,
+          ),
+        ].join(" ")}`,
+      };
+    const skillDestinations = scope.skillDestinations ?? [];
     if (scope.clients.length === 0 && !scope.skill)
       return { status: "current", plannedActions: [] };
     const command = [
@@ -107,6 +155,7 @@ export const planIntegrationMaintenance = async (
       entryPoint,
       "setup",
       ...scope.clients.flatMap((client) => ["--client", client]),
+      ...skillDestinations.flatMap(({ client }) => ["--skill-client", client]),
       `--skill=${String(scope.skill)}`,
     ];
     const execution = await execute([...command, "--dry-run", "--json"]);
@@ -120,11 +169,17 @@ export const planIntegrationMaintenance = async (
       };
     if (plan.data.plannedActions.length === 0)
       return { status: "current", plannedActions: [] };
-    const allowedIds = new Set([
-      ...scope.clients.map((client) => `configure_client:${client}`),
-      ...(scope.skill ? ["install_skill"] : []),
-    ]);
-    if (plan.data.plannedActions.some(({ id }) => !allowedIds.has(id)))
+    const allowedIds = new Set(
+      scope.clients.map((client) => `configure_client:${client}`),
+    );
+    const skillTargets = new Set(skillDestinations.map(({ path }) => path));
+    if (
+      plan.data.plannedActions.some((action) =>
+        action.kind === "install_skill"
+          ? !skillTargets.has(action.target)
+          : !allowedIds.has(action.id),
+      )
+    )
       return {
         status: "unavailable",
         remediation:
@@ -143,6 +198,9 @@ export const planIntegrationMaintenance = async (
       ),
     };
   } catch (cause: unknown) {
+    // Without a supplied scope, the typed failure is the caller's cleanup capability.
+    if (resources === undefined && cause instanceof RegularFileCleanupFailure)
+      throw cause;
     return {
       status: "unavailable",
       remediation: cause instanceof Error ? cause.message : String(cause),

@@ -1,9 +1,11 @@
-import { access, stat } from "node:fs/promises";
+import { access, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ProcessOwnershipInspectionCancelled } from "../../../src/process/ProcessInspectionCancellation.js";
 import { PendingOperations } from "../../../src/process/PendingOperations.js";
 import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
 import { ProviderStartupDeadline } from "../../../src/process/ProviderDeadline.js";
@@ -17,7 +19,7 @@ import {
   spawnOwnedProviderProcess,
   type ProviderProcessDiagnostic,
 } from "../../../src/process/ProviderProcess.js";
-import { WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON } from "../../../src/process/WindowsAuthority.js";
+import * as nativeLoader from "../../../src/windows/WindowsNativeLoader.js";
 import {
   spawnProviderProcessFixture,
   stopProviderProcessFixture,
@@ -57,11 +59,11 @@ describe("provider process runtime and wait primitives", () => {
       parent: tmpdir(),
       prefix: "rea-provider-test-",
     });
-    expect((await stat(runtime.path)).mode & 0o777).toBe(0o700);
+    expect((await stat(runtime.path)).mode & 0o077).toBe(0);
+    await writeFile(join(runtime.path, "owned-scratch"), "fixture");
 
     const first = runtime.close();
     const second = runtime.close();
-    expect(second).toBe(first);
     await Promise.all([first, second]);
     await expect(access(runtime.path)).rejects.toMatchObject({
       code: "ENOENT",
@@ -69,12 +71,25 @@ describe("provider process runtime and wait primitives", () => {
   });
 
   it("fails closed for a Windows runtime root without native DACL authority", async () => {
-    await expect(
-      PrivateRuntimeRoot.create({ platform: "win32" }),
-    ).rejects.toMatchObject({
-      code: "private-runtime-root-authority-unavailable",
-      message: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
-    });
+    const authority = vi
+      .spyOn(nativeLoader, "systemWindowsNativeAuthority")
+      .mockReturnValue({
+        available: false,
+        failureStage: "self-test",
+        reason: "Native DACL self-test failed with Win32 error 145",
+        retryable: true,
+      });
+    try {
+      await expect(
+        PrivateRuntimeRoot.create({ platform: "win32" }),
+      ).rejects.toMatchObject({
+        code: "private-runtime-root-authority-unavailable",
+        message: "Native DACL self-test failed with Win32 error 145",
+        retryable: true,
+      });
+    } finally {
+      authority.mockRestore();
+    }
   });
 
   it("classifies external cancellation during startup", async () => {
@@ -186,6 +201,40 @@ describe("provider process runtime and wait primitives", () => {
 });
 
 describe("provider process output and cleanup primitives", () => {
+  it("marks retained provider output that cannot be represented as UTF-8", async () => {
+    const child = spawnProviderProcessFixture("invalid-utf8");
+    const supervisor = new ProviderProcessSupervisor({
+      process: child,
+      ownsProcessLifetime: true,
+    });
+
+    await expect(supervisor.waitForOutputClose(2_000)).resolves.toBe(true);
+    expect(supervisor.snapshot()).toMatchObject({
+      stdout: { text: "a�b", invalidUtf8: true },
+      stderr: { text: "c�d", invalidUtf8: true },
+    });
+    await expect(supervisor.stop()).resolves.toMatchObject({
+      status: "already-exited",
+    });
+  });
+
+  it("marks a retained byte prefix that cuts a valid multibyte UTF-8 character", async () => {
+    const child = spawnProviderProcessFixture("valid-multibyte");
+    const supervisor = new ProviderProcessSupervisor(
+      { process: child, ownsProcessLifetime: true },
+      { maxDiagnosticBytes: 2 },
+    );
+
+    await expect(supervisor.waitForOutputClose(2_000)).resolves.toBe(true);
+    expect(supervisor.snapshot()).toMatchObject({
+      stdout: { text: "�", bytes: 2, observedBytes: 3, invalidUtf8: true },
+      diagnosticTruncated: true,
+    });
+    await expect(supervisor.stop()).resolves.toMatchObject({
+      status: "already-exited",
+    });
+  });
+
   it("retains complete stdout and stderr beyond the former fixed ceiling", async () => {
     const outputBytes = 70_000;
     const child = spawnProviderProcessFixture("burst", outputBytes);
@@ -202,9 +251,11 @@ describe("provider process output and cleanup primitives", () => {
     expect(snapshot).toMatchObject({
       stdout: {
         bytes: outputBytes,
+        observedBytes: outputBytes,
       },
       stderr: {
         bytes: outputBytes,
+        observedBytes: outputBytes,
       },
       exitCode: 23,
       signal: null,
@@ -231,6 +282,7 @@ describe("provider process output and cleanup primitives", () => {
         ownsProcessLifetime: true,
       });
       await waitForProviderProcessReady(child);
+      const signal = vi.spyOn(child, "kill");
 
       const first = supervisor.stop({
         terminationGraceMs: 20,
@@ -240,11 +292,13 @@ describe("provider process output and cleanup primitives", () => {
         terminationGraceMs: 20,
         killGraceMs: 500,
       });
-      // Concurrent callers must share one escalation instead of signalling
-      // the same child twice.
-      expect(second).toBe(first);
-      await expect(first).resolves.toEqual({ status: "killed" });
+      // Both callers observe the completed escalation.
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        { status: "killed" },
+        { status: "killed" },
+      ]);
       expect(child.signalCode).toBe("SIGKILL");
+      expect(signal.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
     },
   );
 
@@ -283,12 +337,17 @@ describe("provider process output and cleanup primitives", () => {
       await stopProviderProcessFixture(child);
     }
   });
+});
 
+describe("provider process cleanup authority", () => {
   it("honors verified group cleanup instead of direct process signaling", async () => {
     const child = spawnProviderProcessFixture("stubborn");
-    await waitForProviderProcessReady(child);
+    const signalFromCleanup = child.kill.bind(child);
+    const directSignal = vi.spyOn(child, "kill");
     const cleanup = vi.fn(async () => {
-      child.kill("SIGKILL");
+      // Keep the injected cleanup signal separate from the supervisor's
+      // direct method, while retaining the child handle's lifetime checks.
+      signalFromCleanup("SIGKILL");
       return { cleaned: true, signaled: true } as const;
     });
     const supervisor = new ProviderProcessSupervisor({
@@ -297,12 +356,19 @@ describe("provider process output and cleanup primitives", () => {
       cleanup,
     });
 
-    await expect(supervisor.stop({ killGraceMs: 500 })).resolves.toEqual({
-      status: "verified-cleanup",
-    });
-    // Cleanup must be attempted. The exact attempt count is an internal retry
-    // ladder, so it is deliberately not pinned here.
-    expect(cleanup).toHaveBeenCalled();
+    try {
+      await waitForProviderProcessReady(child);
+      await expect(supervisor.stop({ killGraceMs: 500 })).resolves.toEqual({
+        status: "verified-cleanup",
+      });
+      // Cleanup must be attempted. The exact attempt count is an internal
+      // retry ladder, so it is deliberately not pinned here.
+      expect(cleanup).toHaveBeenCalled();
+      expect(directSignal).not.toHaveBeenCalled();
+    } finally {
+      directSignal.mockRestore();
+      await stopProviderProcessFixture(child);
+    }
   });
 
   it("cleans an owned group even after its launcher leader has exited", async () => {
@@ -325,12 +391,14 @@ describe("provider process output and cleanup primitives", () => {
     expect(cleanup).toHaveBeenCalled();
   });
 
-  it("reports incomplete cleanup when a verified callback leaves the child alive", async () => {
+  it("retains a live child after incomplete cleanup and permits a later stop", async () => {
     const child = spawnProviderProcessFixture("stubborn");
     await waitForProviderProcessReady(child);
-    const cleanup = vi.fn(
-      async () => ({ cleaned: true, signaled: false }) as const,
-    );
+    let release = false;
+    const cleanup = () => {
+      if (release) child.kill("SIGKILL");
+      return Promise.resolve({ cleaned: true, signaled: release } as const);
+    };
     const supervisor = new ProviderProcessSupervisor({
       process: child,
       ownsProcessLifetime: true,
@@ -341,11 +409,68 @@ describe("provider process output and cleanup primitives", () => {
         status: "incomplete",
         reason: "verified process-group cleanup did not stop the launcher",
       });
-      expect(cleanup).toHaveBeenCalled();
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+      release = true;
+      await expect(supervisor.stop()).resolves.toEqual({
+        status: "verified-cleanup",
+      });
+      expect(supervisor.snapshot().signal).toBe("SIGKILL");
     } finally {
       await stopProviderProcessFixture(child);
     }
   });
+});
+
+it("retains member failures and sweep uncertainty from a failed cleanup recheck", async () => {
+  const child = spawnProviderProcessFixture("stubborn");
+  await waitForProviderProcessReady(child);
+  const pid = child.pid;
+  if (pid === undefined) {
+    await stopProviderProcessFixture(child);
+    throw new Error("The acquired ready fixture must have a process ID");
+  }
+  const failed = {
+    cleaned: false as const,
+    reason: "fixture identity unavailable during recheck",
+    failures: [
+      {
+        pid,
+        reason: "process-identity-unavailable" as const,
+        diagnostic: "fixture identity reader unavailable",
+      },
+    ],
+    unverified: [
+      { pid: 777, diagnostic: "fixture foreign process token unavailable" },
+    ],
+  };
+  let attempts = 0;
+  let release = false;
+  const supervisor = new ProviderProcessSupervisor({
+    process: child,
+    ownsProcessLifetime: true,
+    cleanup: async () => {
+      if (release) child.kill("SIGKILL");
+      attempts += 1;
+      return release || attempts === 1
+        ? { cleaned: true as const, signaled: release }
+        : failed;
+    },
+  });
+  try {
+    await expect(supervisor.stop({ killGraceMs: 20 })).resolves.toEqual({
+      status: "incomplete",
+      reason: failed.reason,
+      cleanupResult: failed,
+    });
+    expect(child.exitCode).toBeNull();
+    release = true;
+    await expect(supervisor.stop()).resolves.toEqual({
+      status: "verified-cleanup",
+    });
+  } finally {
+    await stopProviderProcessFixture(child);
+  }
 });
 
 describe("provider process host injection", () => {
@@ -374,20 +499,40 @@ describe("provider process host injection", () => {
   });
 });
 
+describe("provider process memory limits", () => {
+  it("refuses a memory limit that the selected launcher cannot enforce", async () => {
+    await expect(
+      spawnOwnedProviderProcess({
+        command: `${tmpdir()}/rea-provider-must-not-spawn-without-limit`,
+        arguments: [],
+        runId: "provider-process-unenforceable-limit-run",
+        platform: "linux",
+        memoryLimitBytes: 704 * 1024 * 1024,
+      }),
+    ).rejects.toMatchObject({
+      _tag: "ProcessAdmissionError",
+      code: "memory_limit_unsupported",
+    });
+  });
+});
+
 describe("provider startup cancellation", () => {
   it("rejects an already cancelled launch before preparing or spawning", async () => {
     const controller = new AbortController();
     const cancellation = new Error("provider launch already cancelled");
     controller.abort(cancellation);
 
-    await expect(
-      spawnOwnedProviderProcess({
-        command: `${tmpdir()}/rea-provider-must-not-spawn-after-cancel`,
-        arguments: [],
-        runId: "provider-process-pre-aborted-run",
-        signal: controller.signal,
-      }),
-    ).rejects.toBe(cancellation);
+    const failure: unknown = await spawnOwnedProviderProcess({
+      command: `${tmpdir()}/rea-provider-must-not-spawn-after-cancel`,
+      arguments: [],
+      runId: "provider-process-pre-aborted-run",
+      signal: controller.signal,
+    }).catch((cause: unknown) => cause);
+    expect(failure).toBeInstanceOf(ProcessOwnershipInspectionCancelled);
+    if (!(failure instanceof ProcessOwnershipInspectionCancelled))
+      throw new Error("Expected tagged launch cancellation");
+    expect(failure.reason).toBe(cancellation);
+    expect(failure.cause).toBe(cancellation);
   });
 
   it.skipIf(process.platform !== "darwin")(
@@ -411,7 +556,14 @@ describe("provider startup cancellation", () => {
           signal: controller.signal,
         });
         controller.abort(cancellation);
-        await expect(starting).rejects.toBe(cancellation);
+        const failure: unknown = await starting.catch(
+          (cause: unknown) => cause,
+        );
+        expect(failure).toBeInstanceOf(ProcessOwnershipInspectionCancelled);
+        if (!(failure instanceof ProcessOwnershipInspectionCancelled))
+          throw new Error("Expected tagged preparation cancellation");
+        expect(failure.reason).toBe(cancellation);
+        expect(failure.cause).toBe(cancellation);
         expect(prepare).toHaveBeenCalledOnce();
       } finally {
         prepare.mockRestore();

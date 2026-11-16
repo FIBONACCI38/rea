@@ -6,10 +6,28 @@ export const resultFor = (
   port: number,
   options: FakeOptions,
   frameTreeReads: number,
-): Readonly<Record<string, unknown>> => {
+  allocateSessionId: () => string = () => "session-1",
+): Readonly<Record<string, unknown>> | undefined => {
   switch (command.method) {
     case "Target.attachToTarget":
-      return attachToTargetResult(options);
+      return attachToTargetResult(options, allocateSessionId);
+    case "Page.getLayoutMetrics":
+      return {
+        cssVisualViewport: {
+          pageX: 0,
+          pageY: 0,
+          clientWidth: 1,
+          clientHeight: 1,
+          scale: 1,
+        },
+        visualViewport: {
+          pageX: 0,
+          pageY: 0,
+          clientWidth: 1,
+          clientHeight: 1,
+          scale: 1,
+        },
+      };
     case "Page.getFrameTree":
       return frameTreeResult(port, options, frameTreeReads);
     case "Page.getResourceTree":
@@ -24,6 +42,8 @@ export const resultFor = (
       return responseBodyResult(options);
     case "Page.captureScreenshot":
       return screenshotResult();
+    case "Browser.getVersion":
+      return browserVersionResult();
     case "Target.getTargets":
       return { targetInfos: targets(port, options).map(endpointTargetToInfo) };
     case "Storage.getUsageAndQuota":
@@ -44,13 +64,46 @@ export const resultFor = (
       return cacheEntriesResult(port);
     case "CacheStorage.requestCachedResponse":
       return cachedResponseResult(options);
-    default:
+    case "Page.enable":
+    case "Page.disable":
+    case "Page.setLifecycleEventsEnabled":
+    case "Performance.enable":
+    case "Performance.disable":
+    case "Network.enable":
+    case "Network.disable":
+    case "Debugger.disable":
+    case "Runtime.enable":
+    case "Runtime.disable":
+    case "Runtime.releaseObjectGroup":
+    case "DOM.enable":
+    case "DOM.disable":
       return {};
+    case "Performance.getMetrics":
+      return { metrics: [{ name: "Timestamp", value: 0 }] };
+    case "Debugger.enable":
+      return { debuggerId: "fake-debugger" };
+    case "Target.detachFromTarget":
+    case "WebMCP.enable":
+      return {};
+    default:
+      return undefined;
   }
 };
 
-const attachToTargetResult = (options: FakeOptions) => ({
-  sessionId: options.invalidAttachedSession ? "" : "session-1",
+/** Chrome's browser-socket reply shape, mirroring the fake's `/json/version`. */
+const browserVersionResult = () => ({
+  protocolVersion: "1.3",
+  product: "FakeChrome/1.0",
+  revision: "@fake-revision",
+  userAgent: "FakeChrome",
+  jsVersion: "13.0",
+});
+
+const attachToTargetResult = (
+  options: FakeOptions,
+  allocateSessionId: () => string,
+) => ({
+  sessionId: options.invalidAttachedSession ? "" : allocateSessionId(),
 });
 
 const frameTreeResult = (
@@ -101,7 +154,7 @@ const responseBodyResult = (options: FakeOptions) =>
       };
 
 const screenshotResult = () => ({
-  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==",
+  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
 });
 
 const storageUsageResult = () => ({

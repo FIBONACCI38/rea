@@ -1,7 +1,20 @@
+import { sqliteDatabaseCapability } from "./sqlite/SqliteDatabaseCapability.js";
+import { persistentDebuggerHostSupported } from "../process/PersistentDebuggerHost.js";
+import { pcapCaptureHostSupported } from "../domain/pcap/pcapAnalysis.js";
 import { describe, expect, it } from "vitest";
 
-import { toolAvailability } from "../contracts/toolOutputSchemaPrimitives.js";
-import { buildCapabilityInventory } from "./CapabilityInventory.js";
+import {
+  buildCapabilityInventory,
+  compactToolAvailability,
+} from "./CapabilityInventory.js";
+import { TOOL_CONTRACTS } from "../contracts/toolContracts.js";
+import { cleanupRetryRemediation } from "../domain/analysisErrorRecovery.js";
+import {
+  expandToolAvailability,
+  toolAvailabilityInventory,
+  toolAvailabilitySummaryInventory,
+  type ToolAvailability,
+} from "../contracts/toolOutputSchemaPrimitives.js";
 
 it("reports module syntax and native resolution availability separately", () => {
   const input = { open: false, capabilities: [] };
@@ -40,10 +53,34 @@ const enabledPolicy: Parameters<typeof buildCapabilityInventory>[1] = {
   v8InspectorObservationEnabled: true,
 };
 
+it("adds the retaining close owner's prerequisite without guessing from a pending flag", () => {
+  const retry = { operation: "close_binary" } as const;
+  const input = { open: false, capabilities: [], cleanup_pending: true };
+  const unavailable = buildCapabilityInventory(
+    { ...input, cleanup_retry: retry },
+    enabledPolicy,
+  ).find(({ name }) => name === "procedure_assembly");
+  expect(unavailable).toMatchObject({
+    available: false,
+    reason: "target_required",
+    remediation: expect.stringContaining(cleanupRetryRemediation(retry)),
+  });
+  const unknownOwner = buildCapabilityInventory(input, enabledPolicy).find(
+    ({ name }) => name === "procedure_assembly",
+  );
+  const original = buildCapabilityInventory(
+    { open: false, capabilities: [] },
+    enabledPolicy,
+  ).find(({ name }) => name === "procedure_assembly");
+  expect(unknownOwner).toEqual(original);
+  expect(unknownOwner?.reason).toBe("target_required");
+});
+
 const status = (
   options: {
     readonly open?: boolean;
     readonly kind?: "executable" | "database" | "archive" | "artifact";
+    readonly format?: string;
     readonly capabilities?: readonly {
       readonly operation: string;
       readonly available: boolean;
@@ -54,22 +91,26 @@ const status = (
 ) => ({
   open: options.open ?? false,
   ...(options.kind === undefined ? {} : { kind: options.kind }),
-  capabilities: (options.capabilities ?? []).map((capability) => ({
-    ...capability,
-    availability_code: capability.available
-      ? null
-      : (capability.availability_code ?? null),
-    effects: {
-      mutates_artifact: false,
-      launches_process: false,
-      may_show_ui: false,
-      may_access_network: false,
-      may_write_filesystem: false,
-      changes_permissions: false,
-      requires_root: false,
-    },
-    limitations: [],
-  })),
+  ...(options.format === undefined ? {} : { format: options.format }),
+  capabilities:
+    options.capabilities === undefined || options.capabilities.length === 0
+      ? []
+      : [
+          {
+            provider: { id: "fixture", name: "Fixture", version: "1" },
+            shared_limitations: [],
+            groups: options.capabilities.map((capability) => ({
+              operations: [capability.operation],
+              effects: [],
+              limitations: [],
+              available: capability.available,
+              reason: capability.reason,
+              availability_code: capability.available
+                ? null
+                : (capability.availability_code ?? null),
+            })),
+          },
+        ],
 });
 
 const entry = (
@@ -84,49 +125,211 @@ const entry = (
   return found;
 };
 
-describe("capability inventory: provider status", () => {
-  it("reports firmware inspection and extraction prerequisites independently", () => {
-    const policy = {
-      processCaptureEnabled: true,
-      firmwareInspectionEnabled: true,
-    };
-    expect(entry("inspect_firmware_regions", status(), policy)).toMatchObject({
-      available: true,
-      surface: "firmware-provider",
-    });
-    expect(entry("extract_firmware", status(), policy)).toMatchObject({
+it("reports the active resource session's dispatch policy without limiting independent tools", () => {
+  const resourceStatus = {
+    ...status({ open: true }),
+    session_kind: "bundle_resources",
+    capabilities: [
+      {
+        provider: { id: "bundle-resources", name: "Resources", version: "1" },
+        shared_limitations: [],
+        groups: [
+          {
+            operations: [
+              "inspect_plist",
+              "decode_interface_builder",
+              "inspect_asset_catalog",
+              "inspect_keyed_archive",
+            ],
+            effects: [],
+            limitations: [],
+            available: true,
+            reason: null,
+            availability_code: null,
+          },
+        ],
+      },
+    ],
+  };
+  const entries = buildCapabilityInventory(resourceStatus, enabledPolicy);
+  for (const name of [
+    "inspect_artifact",
+    "extract_artifact",
+    "trace_dylib_resolution",
+    "get_navigation_context",
+  ])
+    expect(entries.find((item) => item.name === name)).toMatchObject({
       available: false,
-      reason: "provider_missing",
-      remediation: expect.stringContaining("REA_UNBLOB_COMMAND"),
+      reason: "target_unsupported",
+      remediation: expect.stringContaining("open_binary"),
+    });
+  for (const name of [
+    "inspect_plist",
+    "decode_interface_builder",
+    "inspect_asset_catalog",
+    "inspect_keyed_archive",
+    "inspect_pe_imports",
+    "inspect_desktop_application",
+    "close_binary",
+  ])
+    expect(entries.find((item) => item.name === name)).toMatchObject({
+      available: true,
+    });
+  expect(
+    entries.find((item) => item.name === "inspect_apk_signature"),
+  ).toMatchObject({
+    available: true,
+    reason: "available",
+    remediation: null,
+  });
+  const sqlite = sqliteDatabaseCapability(process.versions.node);
+  expect(
+    entries.find((item) => item.name === "inspect_sqlite_database"),
+  ).toMatchObject(
+    sqlite.available
+      ? { available: true }
+      : {
+          available: false,
+          reason: "provider_unavailable",
+          remediation: sqlite.reason,
+        },
+  );
+});
+
+it("derives closed-session address and explicit-path APK availability from their contracts", () => {
+  expect(entry("inspect_address_context", status())).toMatchObject({
+    available: false,
+    reason: "target_required",
+    remediation: expect.any(String),
+  });
+  expect(entry("inspect_apk_signature", status())).toMatchObject({
+    available: true,
+    reason: "available",
+    remediation: null,
+  });
+  expect(
+    entry(
+      "inspect_address_context",
+      status({
+        open: true,
+        kind: "executable",
+        capabilities: [
+          {
+            operation: "inspect_address_context",
+            available: true,
+            reason: null,
+          },
+        ],
+      }),
+    ),
+  ).toMatchObject({ available: true, reason: "available" });
+  expect(entry("inspect_apk_signature", status({ open: true }))).toMatchObject({
+    available: true,
+    reason: "available",
+  });
+  for (const kind of ["artifact", "archive"] as const) {
+    expect(
+      entry("inspect_address_context", status({ open: true, kind })),
+    ).toMatchObject({
+      available: false,
+      reason: "target_unsupported",
+      remediation: expect.stringContaining("explicit document"),
     });
     expect(
-      entry("extract_firmware", status(), {
-        processCaptureEnabled: true,
-        firmwareExtractionEnabled: true,
-      }),
-    ).toMatchObject({ available: true });
-  });
-  it("keeps Android APK operations target-free and reports their explicit engine prerequisite", () => {
-    expect(
-      entry("inspect_android_package", status(), {
-        processCaptureEnabled: true,
-        androidAnalysisEnabled: true,
-      }),
+      entry("inspect_apk_signature", status({ open: true, kind })),
     ).toMatchObject({
       available: true,
-      surface: "android-provider",
       reason: "available",
     });
-    expect(
-      entry("inspect_android_package", status(), {
-        processCaptureEnabled: true,
-      }),
-    ).toMatchObject({
-      available: false,
-      reason: "provider_missing",
-      remediation: expect.stringContaining("REA_JADX_MCP_JAR"),
+  }
+});
+
+describe("ADB and Apktool host availability", () => {
+  it("uses only their selected owner probes", () => {
+    const ready = {
+      status: "available" as const,
+      code: null,
+      reason: null,
+      diagnostics: {},
+    };
+    const configuredButInvalid = {
+      status: "unavailable" as const,
+      code: "not_configured" as const,
+      reason: "REA_ADB_PATH is invalid",
+      remediation: "Set REA_ADB_PATH to an absolute adb executable path.",
+      diagnostics: {},
+    };
+    const readyInventory = buildCapabilityInventory(status(), {
+      ...enabledPolicy,
+      adbAnalysisAvailability: ready,
+      apktoolAnalysisAvailability: ready,
     });
+    expect(
+      readyInventory.find(({ name }) => name === "inspect_adb_client"),
+    ).toMatchObject({ available: true, reason: "available" });
+    expect(
+      readyInventory.find(({ name }) => name === "inspect_apktool_client"),
+    ).toMatchObject({ available: true, reason: "available" });
+
+    const unavailableInventory = buildCapabilityInventory(status(), {
+      ...enabledPolicy,
+      adbAnalysisAvailability: configuredButInvalid,
+      apktoolAnalysisAvailability: {
+        status: "unavailable",
+        code: "unsupported_version",
+        reason: "Apktool 2.6.3 is older than 2.7.0",
+        remediation: "Repair the fixture provider.",
+        diagnostics: {},
+      },
+    });
+    expect(
+      unavailableInventory.find(({ name }) => name === "inspect_adb_client"),
+    ).toMatchObject({ available: false, reason: "provider_missing" });
+    expect(
+      unavailableInventory.find(
+        ({ name }) => name === "decode_android_resources",
+      ),
+    ).toMatchObject({ available: false, reason: "provider_unavailable" });
   });
+});
+
+describe("capability failure reasons", () => {
+  it("keeps an unavailable Android runtime distinct from a missing provider", () => {
+    const inventory = buildCapabilityInventory(status(), {
+      ...enabledPolicy,
+      androidAnalysisAvailability: {
+        status: "unavailable",
+        code: "runtime_unavailable",
+        reason: "The JADX native self-test failed.",
+        remediation: "Repair the fixture provider.",
+        diagnostics: {},
+      },
+    });
+    expect(
+      inventory.find(({ name }) => name === "inspect_android_package"),
+    ).toMatchObject({ available: false, reason: "provider_unavailable" });
+  });
+
+  it("admits physical universal Mach-O targets for native Mach-O operations", () => {
+    expect(
+      entry(
+        "inspect_native_dispatch_metadata",
+        status({
+          open: true,
+          kind: "executable",
+          format: "mach-o-universal",
+          capabilities: [
+            {
+              operation: "inspect_native_dispatch_metadata",
+              available: true,
+              reason: null,
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({ available: true, reason: "available" });
+  });
+
   it.each([
     {
       label: "requires a target",
@@ -210,89 +413,196 @@ describe("capability inventory: provider status", () => {
     if (remediation === null) expect(availability.remediation).toBeNull();
     else expect(availability.remediation).toContain(remediation);
   });
+});
 
-  it("keeps configured workflows callable and reports only real host or provider limits", () => {
-    const inventory = buildCapabilityInventory(status(), {
-      ...enabledPolicy,
-      processCaptureEnabled: false,
-      browserObservationEnabled: false,
-      browserScenarioEnabled: false,
-      electronObservationEnabled: false,
-      electronAutomationEnabled: false,
-      v8InspectorObservationEnabled: false,
+describe("compact tool availability", () => {
+  it("round-trips complete facts, omitted modes, and per-group client requirements", () => {
+    const full = buildCapabilityInventory(status(), enabledPolicy);
+    const alternateRequirements = {
+      required: ["roots"],
+      optional: [],
+      missing_required: ["roots"],
+      missing_optional: [],
+    } satisfies ToolAvailability["client_requirements"];
+    const withOverride = full.map((entry, index) =>
+      index === 1
+        ? {
+            ...entry,
+            available: false as const,
+            reason: "client_capability_missing" as const,
+            remediation: "Use an MCP client with roots support.",
+            client_requirements: alternateRequirements,
+          }
+        : entry,
+    );
+    const compact = compactToolAvailability(withOverride);
+    const expanded = expandToolAvailability(compact).toSorted((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+
+    expect(expanded).toEqual(
+      withOverride.toSorted((left, right) =>
+        left.name.localeCompare(right.name),
+      ),
+    );
+    expect(compact.client_requirements).toEqual(
+      withOverride[0]?.client_requirements,
+    );
+    expect(
+      compact.groups.find((group) => group.client_requirements !== undefined)
+        ?.client_requirements,
+    ).toEqual(alternateRequirements);
+    expect(compact.groups.every((group) => group.names.length > 0)).toBe(true);
+    const names = compact.groups.flatMap((group) => group.names).sort();
+    expect(names).toEqual(TOOL_CONTRACTS.map(({ name }) => name).sort());
+    expect(new Set(names).size).toBe(names.length);
+    expect(expanded.some((entry) => !Object.hasOwn(entry, "modes"))).toBe(true);
+  });
+
+  it("preserves an empty inventory with an explicit empty client baseline", () => {
+    const compact = compactToolAvailability([]);
+    expect(compact).toEqual({
+      client_requirements: {
+        required: [],
+        optional: [],
+        missing_required: [],
+        missing_optional: [],
+      },
+      groups: [],
     });
-    const byName = new Map(inventory.map((item) => [item.name, item]));
-    expect(byName.get("capture_process_scenario")).toMatchObject({
-      available: false,
-      reason: "unsupported_host",
-    });
-    expect(byName.get("inspect_web_page")).toMatchObject({
-      available: false,
-      reason: "provider_missing",
-    });
+    expect(expandToolAvailability(compact)).toEqual([]);
+  });
+
+  it("rejects malformed compact facts and accepts an equivalent explicit baseline", () => {
+    const compact = compactToolAvailability(
+      buildCapabilityInventory(status(), enabledPolicy),
+    );
+    const firstGroup = compact.groups[0];
+    expect(firstGroup).toBeDefined();
+    if (firstGroup === undefined) throw new Error("Expected tool groups");
+    const availableIndex = compact.groups.findIndex((group) => group.available);
+    if (availableIndex < 0) throw new Error("Expected an available tool group");
+
+    const malformedInventories = [
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === 0
+            ? { ...group, effects: [...group.effects, "unknown_effect"] }
+            : group,
+        ),
+      },
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === 0
+            ? {
+                ...group,
+                annotations: [...group.annotations, "unknown_hint"],
+              }
+            : group,
+        ),
+      },
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === 0 ? { ...group, names: [] } : group,
+        ),
+      },
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === 0 ? { ...group, names: [""] } : group,
+        ),
+      },
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === availableIndex
+            ? { ...group, reason: "provider_missing" }
+            : group,
+        ),
+      },
+      {
+        ...compact,
+        groups: compact.groups.map((group, index) =>
+          index === availableIndex
+            ? { ...group, remediation: "unexpected remediation" }
+            : group,
+        ),
+      },
+    ];
+    for (const malformed of malformedInventories)
+      expect(toolAvailabilityInventory.safeParse(malformed).success).toBe(
+        false,
+      );
+
+    const inheritedGroup = compact.groups.find(
+      (group) => group.client_requirements === undefined,
+    );
+    expect(inheritedGroup).toBeDefined();
+    if (inheritedGroup === undefined)
+      throw new Error("Expected an inherited client-requirements group");
+    const explicitBaseline = {
+      ...compact,
+      groups: compact.groups.map((group) =>
+        group === inheritedGroup
+          ? { ...group, client_requirements: compact.client_requirements }
+          : group,
+      ),
+    };
+    const parsedOverride =
+      toolAvailabilityInventory.safeParse(explicitBaseline);
+    expect(parsedOverride.success).toBe(true);
+    if (parsedOverride.success)
+      expect(expandToolAvailability(parsedOverride.data)).toEqual(
+        expandToolAvailability(compact),
+      );
   });
 });
 
-describe("capability inventory: caller guidance", () => {
-  it("gives every unavailable public tool an actionable remediation", () => {
-    const inventory = buildCapabilityInventory(status(), {
-      ...enabledPolicy,
-      processCaptureEnabled: false,
-      browserObservationEnabled: false,
-      electronObservationEnabled: false,
-      v8InspectorObservationEnabled: false,
+it("reports target restrictions for navigation modes even when providers are declared", () => {
+  const capabilities = [
+    "current_document",
+    "current_address",
+    "resolve_containing_procedure",
+  ].map((operation) => ({ operation, available: true, reason: null }));
+  for (const kind of ["artifact", "archive"] as const) {
+    const navigation = entry(
+      "get_navigation_context",
+      status({ open: true, kind, capabilities }),
+    );
+    expect(navigation).toMatchObject({
+      available: false,
+      reason: "target_unsupported",
+      default_mode_available: false,
+      modes: [
+        { name: "current_selection", available: false },
+        { name: "explicit_document", available: false },
+      ],
     });
-    for (const availability of inventory)
-      if (!availability.available) {
-        expect(availability.reason).not.toBe("available");
-        expect(availability.remediation).toEqual(expect.any(String));
-        expect(availability.remediation?.length).toBeGreaterThan(0);
-      }
-  });
+    for (const mode of navigation.modes ?? [])
+      expect(mode.remediation).toBe(navigation.remediation);
+  }
+});
 
-  it("keeps the public availability schema consistent with generated states", () => {
-    const inventory = buildCapabilityInventory(status(), enabledPolicy);
-    const unavailable = inventory.find(({ available }) => !available);
-    expect(unavailable).toBeDefined();
-    expect(toolAvailability.safeParse(unavailable).success).toBe(true);
+describe("partial navigation availability", () => {
+  it("requires a target before diagnosing navigation provider modes", () => {
+    expect(entry("get_navigation_context", status())).toMatchObject({
+      available: false,
+      reason: "target_required",
+      default_mode_available: false,
+      modes: [
+        { name: "current_selection", available: false },
+        { name: "explicit_document", available: false },
+      ],
+    });
     expect(
-      toolAvailability.safeParse({ ...unavailable, available: true }).success,
-    ).toBe(false);
-    expect(
-      toolAvailability.safeParse({
-        ...unavailable,
-        available: false,
-        reason: "available",
-      }).success,
-    ).toBe(false);
-  });
-
-  it("does not require interactive elicitation for process capture", () => {
-    const withoutElicitation = buildCapabilityInventory(
-      status(),
-      enabledPolicy,
-    ).find(({ name }) => name === "capture_process_scenario");
-    const withElicitation = buildCapabilityInventory(status(), enabledPolicy, {
-      elicitation_form: true,
-      elicitation_url: false,
-      roots: false,
-      sampling: false,
-    }).find(({ name }) => name === "capture_process_scenario");
-
-    expect(withoutElicitation?.client_requirements).toEqual({
-      required: [],
-      optional: [],
-      missing_required: [],
-      missing_optional: [],
-    });
-    expect(withElicitation?.client_requirements).toEqual({
-      required: [],
-      optional: [],
-      missing_required: [],
-      missing_optional: [],
+      TOOL_CONTRACTS.find((tool) => tool.name === "get_navigation_context"),
+    ).toMatchObject({
+      requiresActiveTarget: true,
     });
   });
-
   it("allows explicit documents when the provider has no current-document getter", () => {
     const capabilities = [
       "current_document",
@@ -379,26 +689,530 @@ describe("capability inventory: caller guidance", () => {
       remediation: "Navigation requires macOS.",
     });
   });
+
+  it("lists shared missing operations once in combined remediation", () => {
+    const availability = entry(
+      "get_navigation_context",
+      status({ open: true, kind: "executable" }),
+    );
+
+    expect(availability).toMatchObject({
+      reason: "provider_missing",
+      remediation: expect.stringMatching(/configure.*provider/i),
+      modes: [
+        {
+          name: "current_selection",
+          missing_operations: [
+            "current_document",
+            "current_address",
+            "resolve_containing_procedure",
+          ],
+        },
+        {
+          name: "explicit_document",
+          missing_operations: [
+            "current_address",
+            "resolve_containing_procedure",
+          ],
+        },
+      ],
+    });
+    for (const operation of [
+      "current_document",
+      "current_address",
+      "resolve_containing_procedure",
+    ]) {
+      expect(availability.remediation?.split(operation)).toHaveLength(2);
+    }
+  });
 });
 
-describe("optional JavaScript recovery availability", () => {
-  it("keeps optional recovery target-free and does not disable other static workflows", () => {
-    expect(entry("recover_javascript_sources", status())).toMatchObject({
-      available: false,
-      reason: "provider_missing",
-      remediation: expect.stringContaining("REA_WAKARU_COMMAND"),
-    });
+it("reports host denial before target mismatch but keeps composed workflow prerequisites", () => {
+  const capability = {
+    operation: "inspect_macho",
+    available: false,
+    availability_code: "unsupported_host" as const,
+    reason: "Native macOS utilities require macOS.",
+  };
+  for (const target of [
+    {},
+    { open: true, kind: "archive" as const, format: "zip" },
+  ]) {
     expect(
-      entry("recover_javascript_sources", status(), {
-        processCaptureEnabled: true,
-        javascriptRecoveryEnabled: true,
+      entry("inspect_macho", status({ ...target, capabilities: [capability] })),
+    ).toMatchObject({
+      reason: "unsupported_host",
+      remediation: capability.reason,
+    });
+  }
+  expect(
+    entry(
+      "inspect_native_dispatch_metadata",
+      status({
+        capabilities: [
+          { ...capability, operation: "inspect_native_dispatch_metadata" },
+        ],
       }),
+    ).reason,
+  ).toBe("target_required");
+});
+
+describe("binary_overview capability requirements", () => {
+  it("admits a native overview without requiring full inventory operations", () => {
+    expect(
+      entry(
+        "binary_overview",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: [
+            {
+              operation: "read_binary_inventory_summary",
+              available: true,
+              reason: null,
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({ available: true, reason: "available" });
+  });
+  it("admits a provider with current_document and other mandatory capabilities", () => {
+    const capabilities = [
+      "current_document",
+      "list_procedures",
+      "list_strings",
+    ].map((operation) => ({ operation, available: true, reason: null }));
+    expect(
+      entry(
+        "binary_overview",
+        status({ open: true, kind: "executable", capabilities }),
+      ),
     ).toMatchObject({
       available: true,
-      surface: "application",
+      reason: "available",
+      remediation: null,
     });
-    expect(entry("analyze_javascript_application", status())).toMatchObject({
+  });
+
+  it("admits a provider with list_documents and other mandatory capabilities", () => {
+    const capabilities = [
+      "list_documents",
+      "list_procedures",
+      "list_strings",
+    ].map((operation) => ({ operation, available: true, reason: null }));
+    expect(
+      entry(
+        "binary_overview",
+        status({ open: true, kind: "executable", capabilities }),
+      ),
+    ).toMatchObject({
       available: true,
+      reason: "available",
+      remediation: null,
     });
+  });
+
+  it("reports document selection remediation when neither current_document nor list_documents is declared", () => {
+    const capabilities = [
+      "list_segments",
+      "list_procedures",
+      "list_strings",
+    ].map((operation) => ({ operation, available: true, reason: null }));
+    expect(
+      entry(
+        "binary_overview",
+        status({ open: true, kind: "executable", capabilities }),
+      ),
+    ).toMatchObject({
+      available: false,
+      reason: "provider_missing",
+      remediation: expect.stringMatching(
+        /configure.*provider.*current_document.*list_documents/i,
+      ),
+    });
+  });
+
+  it("keeps binary overview available when a declared segment facet is unavailable", () => {
+    const capabilities = [
+      {
+        operation: "list_segments",
+        available: false,
+        reason: "This upstream profile does not expose segment enumeration.",
+      },
+      { operation: "list_documents", available: true, reason: null },
+      { operation: "list_procedures", available: true, reason: null },
+      { operation: "list_strings", available: true, reason: null },
+    ];
+    expect(
+      entry(
+        "binary_overview",
+        status({ open: true, kind: "executable", capabilities }),
+      ),
+    ).toMatchObject({ available: true, reason: "available" });
+  });
+
+  it("reports provider_unavailable when declared document selection capability is unavailable", () => {
+    const capabilities = [
+      { operation: "list_segments", available: true, reason: null },
+      {
+        operation: "current_document",
+        available: false,
+        reason: "Document view is closed",
+      },
+      { operation: "list_procedures", available: true, reason: null },
+      { operation: "list_strings", available: true, reason: null },
+    ];
+    expect(
+      entry(
+        "binary_overview",
+        status({ open: true, kind: "executable", capabilities }),
+      ),
+    ).toMatchObject({
+      available: false,
+      reason: "provider_unavailable",
+      remediation: "Document view is closed",
+    });
+  });
+});
+
+describe("trace_feature requirements", () => {
+  const capabilities = (operations: readonly string[]) =>
+    operations.map((operation) => ({
+      operation,
+      available: true,
+      reason: null,
+    }));
+
+  it("remains available when owner lookup is unavailable", () => {
+    expect(
+      entry(
+        "trace_feature",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: capabilities([
+            "search_strings",
+            "search_procedures",
+            "xrefs",
+          ]),
+        }),
+      ),
+    ).toMatchObject({ available: true, reason: "available" });
+  });
+
+  it("needs the search operations the workflow actually calls", () => {
+    expect(
+      entry(
+        "trace_feature",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: capabilities([
+            "search_strings",
+            "search_procedures",
+            "xrefs",
+            "resolve_containing_procedure",
+          ]),
+        }),
+      ),
+    ).toMatchObject({ available: true, reason: "available" });
+  });
+
+  it.each(["search_strings", "search_procedures"])(
+    "is unavailable without %s",
+    (missing) => {
+      const operations = [
+        "search_strings",
+        "search_procedures",
+        "xrefs",
+        "resolve_containing_procedure",
+      ].filter((operation) => operation !== missing);
+
+      expect(
+        entry(
+          "trace_feature",
+          status({
+            open: true,
+            kind: "executable",
+            capabilities: capabilities(operations),
+          }),
+        ),
+      ).toMatchObject({ available: false, reason: "provider_missing" });
+    },
+  );
+
+  it("is unavailable when only the list operations exist", () => {
+    expect(
+      entry(
+        "trace_feature",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: capabilities([
+            "list_strings",
+            "list_procedures",
+            "xrefs",
+            "resolve_containing_procedure",
+          ]),
+        }),
+      ),
+    ).toMatchObject({ available: false, reason: "provider_missing" });
+  });
+});
+
+describe("firmware operation recovery", () => {
+  it.each([
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ])(
+    "keeps inspection=%s and extraction=%s independent",
+    (inspection, extraction) => {
+      const inventory = buildCapabilityInventory(status(), {
+        processCaptureEnabled: false,
+        firmwareInspectionEnabled: inspection,
+        firmwareExtractionEnabled: extraction,
+      });
+      for (const [name, enabled, command, otherCommand] of [
+        [
+          "inspect_firmware_regions",
+          inspection,
+          "REA_BINWALK_COMMAND",
+          "REA_UNBLOB_COMMAND",
+        ],
+        [
+          "extract_firmware",
+          extraction,
+          "REA_UNBLOB_COMMAND",
+          "REA_BINWALK_COMMAND",
+        ],
+      ] as const) {
+        const tool = inventory.find((candidate) => candidate.name === name);
+        expect(tool).toMatchObject({
+          available: enabled,
+          reason: enabled ? "available" : "provider_missing",
+        });
+        if (enabled) {
+          expect(tool?.remediation).toBeNull();
+        } else {
+          expect(tool?.remediation).toContain(command);
+          expect(tool?.remediation).not.toContain(otherCommand);
+          expect(tool?.remediation).toContain("prlimit");
+          expect(tool?.remediation).toContain("procps ps");
+          expect(tool?.remediation?.includes("external extractor")).toBe(
+            name === "extract_firmware",
+          );
+        }
+      }
+      const byName = (left: ToolAvailability, right: ToolAvailability) =>
+        left.name.localeCompare(right.name);
+      expect(
+        expandToolAvailability(compactToolAvailability(inventory)).toSorted(
+          byName,
+        ),
+      ).toEqual(inventory.toSorted(byName));
+    },
+  );
+});
+
+const HOST_RESTRICTED_TOOLS = [
+  ["inspect_packet_capture", "packetCapture", "packetCaptureEnabled"],
+  ["inspect_packet_fields", "packetCapture", "packetCaptureEnabled"],
+  ["decode_signal_recording", "signalRecording", "signalRecordingEnabled"],
+  ["inspect_signal_decoders", "signalRecording", "signalRecordingEnabled"],
+  ["inspect_evm_interface", "evmInterface", "evmInterfaceEnabled"],
+  ["inspect_binary_layout", "binaryLayout", "binaryLayoutEnabled"],
+  ["inspect_recorded_crash", "recordedCrash", "recordedCrashEnabled"],
+  [
+    "inspect_firmware_regions",
+    "firmwareInspection",
+    "firmwareInspectionEnabled",
+  ],
+  ["extract_firmware", "firmwareExtraction", "firmwareExtractionEnabled"],
+  [
+    "recover_javascript_sources",
+    "javascriptRecovery",
+    "javascriptRecoveryEnabled",
+  ],
+] as const;
+
+describe("host-restricted integrations", () => {
+  it.each(HOST_RESTRICTED_TOOLS)(
+    "reports %s on an unsupported host before its configuration",
+    (name, feature, enabledField) => {
+      const availability = (enabled: boolean, hostUnsupported: boolean) =>
+        buildCapabilityInventory(
+          { open: false, capabilities: [] },
+          {
+            processCaptureEnabled: true,
+            ...({ [enabledField]: enabled } as Record<
+              typeof enabledField,
+              boolean
+            >),
+            hostUnsupported: { [feature]: hostUnsupported },
+          },
+        ).find((tool) => tool.name === name);
+      expect(availability(true, true)).toMatchObject({
+        available: false,
+        reason: "unsupported_host",
+      });
+      expect(availability(false, false)).toMatchObject({
+        available: false,
+        reason: "provider_missing",
+      });
+      expect(availability(true, false)).toMatchObject({
+        available: true,
+        reason: "available",
+      });
+    },
+  );
+});
+
+it.each(["darwin", "linux", "win32"])(
+  "distinguishes pcap capture host support from its target-free client probe on %s",
+  (platform) => {
+    const tools = buildCapabilityInventory(
+      { open: false, capabilities: [] },
+      {
+        processCaptureEnabled: true,
+        hostUnsupported: { pcapCapture: !pcapCaptureHostSupported(platform) },
+      },
+    );
+    expect(
+      tools.find(({ name }) => name === "inspect_pcap_client"),
+    ).toMatchObject({ available: true, reason: "available" });
+    expect(
+      tools.find(({ name }) => name === "inspect_pcap_capture"),
+    ).toMatchObject(
+      platform === "darwin"
+        ? {
+            available: false,
+            reason: "unsupported_host",
+            remediation: expect.stringContaining("native memory bound"),
+          }
+        : { available: true, reason: "available" },
+    );
+  },
+);
+
+it("keeps independent native sessions discoverable without an unrelated binary target", () => {
+  const entries = buildCapabilityInventory(status(), enabledPolicy);
+  for (const name of [
+    "list_cutter_sessions",
+    "cutter_command",
+    "start_gdb_session",
+    "gdb_console",
+    "gdb_session_status",
+    "close_gdb_session",
+    "start_rizin_debug_session",
+    "rizin_debug_command",
+    "rizin_debug_session_status",
+    "close_rizin_debug_session",
+    "inspect_with_objdump",
+    "execute_rizin_command",
+  ]) {
+    expect(
+      entries.find((entry) => entry.name === name),
+      name,
+    ).toMatchObject({ available: true });
+  }
+  expect(entries.find((entry) => entry.name === "inspect_macho")).toMatchObject(
+    { available: false, reason: "target_required" },
+  );
+});
+
+it("reports standalone reverse-engineering tools unavailable when launch failure is observed", () => {
+  const repair =
+    "Set REA_OBJDUMP_COMMAND to an installed executable GNU objdump command.";
+  const entries = buildCapabilityInventory(status(), {
+    ...enabledPolicy,
+    commandProviderFailures: {
+      inspect_with_objdump: {
+        reason: "Could not launch selected objdump executable",
+        remediation: repair,
+      },
+    },
+  });
+  expect(
+    entries.find((entry) => entry.name === "inspect_with_objdump"),
+  ).toMatchObject({
+    available: false,
+    reason: "provider_unavailable",
+    remediation: repair,
+  });
+  expect(
+    entries.find((entry) => entry.name === "execute_rizin_command"),
+  ).toMatchObject({
+    available: true,
+    reason: "available",
+    remediation: null,
+  });
+});
+
+it.each(["darwin", "linux", "win32"] as const)(
+  "reports the persistent debugger start host restriction on %s",
+  (platform) => {
+    const entries = buildCapabilityInventory(status(), {
+      ...enabledPolicy,
+      hostUnsupported: {
+        persistentDebugger: !persistentDebuggerHostSupported(platform),
+      },
+    });
+    for (const name of ["start_gdb_session", "start_rizin_debug_session"])
+      expect(entries.find((entry) => entry.name === name)).toMatchObject(
+        platform === "linux"
+          ? { available: true, reason: "available" }
+          : {
+              available: false,
+              reason: "unsupported_host",
+              remediation: expect.stringContaining("Linux"),
+            },
+      );
+    for (const name of ["gdb_session_status", "close_rizin_debug_session"])
+      expect(entries.find((entry) => entry.name === name)).toMatchObject({
+        available: true,
+      });
+  },
+);
+
+describe("summary tool availability", () => {
+  it("summarizes every tool's current availability without static catalog flags", () => {
+    const full = buildCapabilityInventory(status(), enabledPolicy);
+    const withOverride = full.map((entry, index) =>
+      index === 1
+        ? {
+            ...entry,
+            available: false as const,
+            reason: "client_capability_missing" as const,
+            remediation: "Use an MCP client with roots support.",
+            client_requirements: {
+              required: ["roots" as const],
+              optional: [],
+              missing_required: ["roots" as const],
+              missing_optional: [],
+            },
+          }
+        : entry,
+    );
+    const complete = compactToolAvailability(withOverride);
+    const summary = compactToolAvailability(withOverride, "summary");
+
+    expect(toolAvailabilitySummaryInventory.parse(summary)).toEqual(summary);
+    expect(toolAvailabilityInventory.safeParse(summary).success).toBe(false);
+    expect(summary.groups.length).toBeLessThan(complete.groups.length);
+    expect(JSON.stringify(summary).length).toBeLessThan(
+      JSON.stringify(complete).length / 2,
+    );
+    for (const group of summary.groups)
+      for (const field of ["surface", "effects", "annotations"])
+        expect(Object.hasOwn(group, field)).toBe(false);
+    const byName = (left: { name: string }, right: { name: string }) =>
+      left.name.localeCompare(right.name);
+    expect(expandToolAvailability(summary).toSorted(byName)).toEqual(
+      withOverride
+        .map(({ surface: _s, effects: _e, annotations: _a, ...entry }) => entry)
+        .toSorted(byName),
+    );
   });
 });

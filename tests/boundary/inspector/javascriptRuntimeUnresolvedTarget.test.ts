@@ -4,12 +4,24 @@ import { pathToFileURL } from "node:url";
 
 import { expect, test } from "vitest";
 
-import { analyzeJavaScriptApplication } from "../../../src/application/javascript/JavaScriptApplicationService.js";
+import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
 import { createJavaScriptRuntimeObservationEvidence } from "../../../src/application/javascript/JavaScriptRuntimeObservationEvidence.js";
 import { V8InspectorProvider } from "../../../src/inspector/V8InspectorProvider.js";
-import { reconcileJavaScriptRuntime } from "../../../src/domain/javascript/javascriptRuntimeReconciliation.js";
+import {
+  readRuntimeReconciliationInput,
+  reconcileJavaScriptRuntime,
+} from "../../../src/domain/javascript/javascriptRuntimeReconciliation.js";
+import { reconcileJavaScriptRuntimeInputSchema } from "../../../src/domain/javascript/javascriptRuntimeReconciliationSchemas.js";
 import { startFakeV8Inspector } from "../../fixtures/inspector/fakeV8Inspector.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+
+const reconcileInput = (input: unknown) => {
+  const result = readRuntimeReconciliationInput(
+    reconcileJavaScriptRuntimeInputSchema.parse(input),
+  );
+  if (!result.ok) throw result.error;
+  return reconcileJavaScriptRuntime(result.value);
+};
 
 test("keeps unresolved target identity unknown while matching verified loaded scripts", async () => {
   const root = await createTestTempDirectory("rea-unresolved-runtime-");
@@ -22,7 +34,6 @@ test("keeps unresolved target identity unknown while matching verified loaded sc
   try {
     await writeFile(entry, "export const fixture = true;\n");
     const analysis = await analyzeJavaScriptApplication({ input_path: root });
-    expect(analysis.ok).toBe(true);
     if (!analysis.ok) throw analysis.error;
     const provider = new V8InspectorProvider();
     const input = {
@@ -31,7 +42,6 @@ test("keeps unresolved target identity unknown while matching verified loaded sc
       observation_ms: 10,
     };
     const observed = await provider.observe(input);
-    expect(observed.ok).toBe(true);
     if (!observed.ok) throw observed.error;
     const evidence = createJavaScriptRuntimeObservationEvidence(
       "observe_javascript_runtime",
@@ -39,7 +49,7 @@ test("keeps unresolved target identity unknown while matching verified loaded sc
       observed.value,
       provider.identity(),
     );
-    const result = reconcileJavaScriptRuntime({
+    const result = reconcileInput({
       static_layers: [{ role: "application", analysis: analysis.value }],
       runtime_observations: [evidence],
     });

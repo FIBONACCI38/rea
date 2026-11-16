@@ -1,49 +1,92 @@
-import { AsarArtifactReader } from "../AsarArtifactReader.js";
-import type { ArtifactReader } from "../ArtifactReader.js";
-import { DirectoryArtifactReader } from "../DirectoryArtifactReader.js";
-import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
-import { NativeDmgArtifactReader } from "../NativeDmgArtifactReader.js";
-import { ZipArtifactReader } from "../ZipArtifactReader.js";
-import type { ArtifactNode } from "../../domain/artifactGraph.js";
-
-export const createReader = async (
+import type { ArtifactReaderAdmission } from "../ArtifactReaderAdmission.js";
+import type { ArtifactReaderLimits } from "../../domain/artifactReaderLimits.js";
+import type { AsarHeaderAdmission } from "../../config/asarHeaderAdmission.js";
+import type {
+  ArtifactReader,
+  ArtifactReaderTraversal,
+} from "../ArtifactReader.js";
+import { artifactFormatDescriptor } from "../artifactFormats.js";
+import { createArtifactReader } from "../createArtifactReader.js";
+import type {
+  ArtifactInventoryCoverage,
+  ArtifactOccurrence,
+} from "../../domain/artifactGraph.js";
+import {
+  isZipPackageFormat,
+  ZIP_NON_ENTRY_LIMITATION,
+} from "../../domain/zipPackageFormat.js";
+export const createReader = (
   path: string,
-  format: ArtifactNode["format"],
-  signal?: AbortSignal,
-): Promise<ArtifactReader | undefined> => {
-  switch (format) {
-    case "directory":
-      return new DirectoryArtifactReader(path);
-    case "zip":
-    case "ipa":
-    case "apk":
-    case "msix":
-    case "appx":
-      return new ZipArtifactReader(path, format);
-    case "asar":
-      return new AsarArtifactReader(path);
-    case "mach-o-universal":
-      return process.platform === "darwin"
-        ? new MachOSliceArtifactReader(path)
-        : undefined;
-    case "dmg":
-      if (process.platform !== "darwin") return undefined;
-      return NativeDmgArtifactReader.create(path, signal);
-    default:
-      return undefined;
-  }
+  format: ArtifactOccurrence["artifact_format"],
+  environment: Readonly<NodeJS.ProcessEnv>,
+  readerAdmission?: ArtifactReaderAdmission,
+  asarHeaderAdmission?: AsarHeaderAdmission,
+  selectedPath?: string,
+  readerLimits?: ArtifactReaderLimits,
+): ArtifactReader | undefined => {
+  if (
+    artifactFormatDescriptor(format)?.requiresDarwin === true &&
+    process.platform !== "darwin"
+  )
+    return undefined;
+  return createArtifactReader(path, format, {
+    environment,
+    unreadableDirectories: "omit",
+    admission: readerAdmission,
+    asarHeaderAdmission,
+    selectedPath,
+    readerLimits,
+  });
 };
 
-export const inventoryLimitations = (
-  format: ArtifactNode["format"],
+/** Decide traversal scope and availability once, independently of diagnostic wording. */
+export const inventoryCoverage = (
+  format: ArtifactOccurrence["artifact_format"],
   reader: ArtifactReader | undefined,
-): string[] => {
-  if (reader !== undefined) return [];
-  if (format === "dmg" || format === "pkg")
-    return [
-      `${format.toUpperCase()} root hash is observed; child inventory requires a native macOS adapter.`,
-    ];
-  if (format === "mach-o-universal" && process.platform !== "darwin")
-    return ["Universal Mach-O slices require the native macOS lipo adapter."];
-  return ["Artifact has no child container entries."];
+  traversal: ArtifactReaderTraversal,
+): {
+  readonly coverage: ArtifactInventoryCoverage;
+  readonly limitations: string[];
+} => {
+  if (reader !== undefined)
+    return {
+      coverage: { scope: "container-entries", status: traversal.status },
+      limitations: [
+        ...(isZipPackageFormat(reader.format)
+          ? [ZIP_NON_ENTRY_LIMITATION]
+          : []),
+        ...(artifactFormatDescriptor(reader.format)?.readerLimitation ===
+        undefined
+          ? []
+          : [artifactFormatDescriptor(reader.format)!.readerLimitation!]),
+        ...traversal.limitations,
+      ],
+    };
+  const absent = artifactFormatDescriptor(format)?.absentInventory ?? "root";
+  // dmg and pkg reach here only after classifyRootFormat matched their bytes.
+  if (absent === "platform")
+    return {
+      coverage: { scope: "container-entries", status: "unknown" },
+      limitations: [
+        `${format.toUpperCase()} root hash is observed; child inventory requires a native macOS adapter.`,
+      ],
+    };
+  if (absent === "universal")
+    return {
+      coverage: { scope: "container-entries", status: "unknown" },
+      limitations: [
+        "Universal Mach-O slices require the native macOS lipo adapter.",
+      ],
+    };
+  if (absent === "unavailable")
+    return {
+      coverage: { scope: "container-entries", status: "unknown" },
+      limitations: [`${format} child inventory reader is unavailable.`],
+    };
+  return {
+    coverage: { scope: "root", status: "complete" },
+    limitations: [
+      "Inventory covers root bytes only; child container entries were not examined.",
+    ],
+  };
 };

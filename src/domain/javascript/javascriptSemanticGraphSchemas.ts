@@ -1,11 +1,16 @@
 import { z } from "zod";
 
-import { applicationGraphEvidenceSchema } from "./javascriptApplicationEvidenceSchemas.js";
-import { jsonValueSchema } from "../jsonValue.js";
-import { digestSchema } from "../digests.js";
-import { prefixedDigestSchema } from "../digests.js";
+import { javascriptSourceRangeSchema } from "./javascriptSourceCoordinates.js";
 
-const boundedTextSchema = z.string().min(1);
+import {
+  applicationGraphEvidenceContextSchema,
+  applicationGraphEvidenceLocationSchema,
+  applicationGraphEvidenceSchema,
+} from "./javascriptApplicationEvidenceSchemas.js";
+import { jsonValueSchema } from "../jsonValue.js";
+import { digestSchema, prefixedDigestSchema } from "../digests.js";
+import { nonEmptyTextSchema } from "../textSchemas.js";
+
 const semanticNodeIdSchema = prefixedDigestSchema("jsrg_node");
 const semanticRelationIdSchema = z
   .string()
@@ -13,6 +18,21 @@ const semanticRelationIdSchema = z
 const semanticUnknownIdSchema = z
   .string()
   .regex(/^jsrg_unknown_[a-f0-9]{64}$/u);
+const semanticEvidenceContextIdSchema = z
+  .string()
+  .regex(/^jsrg_evidence_[a-f0-9]{64}$/u);
+
+/** One canonical owner for provenance shared by semantic graph facts. */
+export const javaScriptSemanticEvidenceContextSchema =
+  applicationGraphEvidenceContextSchema.extend({
+    context_id: semanticEvidenceContextIdSchema,
+  });
+
+/** Location-specific reference to one exact graph-level evidence context. */
+export const javaScriptSemanticEvidenceReferenceSchema = z.strictObject({
+  context_id: semanticEvidenceContextIdSchema,
+  location: applicationGraphEvidenceLocationSchema,
+});
 
 /** Semantic entity kinds admitted by JavaScript Semantic Relation Graph. */
 export const JAVASCRIPT_SEMANTIC_NODE_KINDS = [
@@ -80,6 +100,7 @@ export const JAVASCRIPT_SEMANTIC_RELATIONS = [
   "detaches-task",
   "dispatches-candidate",
   "forwards-signal",
+  "influences",
   "listens-error",
   "listens-exit",
   "owns",
@@ -128,6 +149,7 @@ export const JAVASCRIPT_SEMANTIC_RELATION_FAMILY = {
   "detaches-task": "promise-ownership",
   "dispatches-candidate": "event",
   "forwards-signal": "child-process",
+  influences: "data-flow",
   "listens-error": "child-process",
   "listens-exit": "child-process",
   owns: "promise-ownership",
@@ -165,37 +187,16 @@ const relativePathSchema = z
   .refine(
     (path) =>
       !path.startsWith("/") &&
-      !path.includes("\\") &&
       path.split("/").every((part) => !["", ".", ".."].includes(part)),
     "Expected a normalized relative POSIX path without traversal",
   );
-
-const sourcePointSchema = z.strictObject({
-  line: z.number().int().min(1),
-  column: z.number().int().min(0),
-});
-
-const sourceRangeSchema = z
-  .strictObject({ start: sourcePointSchema, end: sourcePointSchema })
-  .superRefine((range, context) => {
-    if (
-      range.end.line < range.start.line ||
-      (range.end.line === range.start.line &&
-        range.end.column < range.start.column)
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["end"],
-        message: "Source range end must not precede its start",
-      });
-  });
 
 const semanticPropertiesSchema = z.record(z.string().min(1), jsonValueSchema);
 
 const semanticNodeIdentitySchema = z.strictObject({
   artifact_sha256: digestSchema,
   module_path: relativePathSchema,
-  source_range: sourceRangeSchema.nullable(),
+  source_range: javascriptSourceRangeSchema.nullable(),
   role_key: z.string().min(1),
 });
 
@@ -213,11 +214,10 @@ export const javaScriptSemanticNodeInputSchema = z.strictObject({
 /** One exact, artifact-version semantic entity. */
 export const javaScriptSemanticNodeSchema =
   javaScriptSemanticNodeInputSchema.extend({
-    node_id: semanticNodeIdSchema,
-    identifier_strategy: z.strictObject({
-      strategy: z.literal("semantic-content-sha256"),
-      stability: z.literal("artifact-version"),
-    }),
+    evidence: javaScriptSemanticEvidenceReferenceSchema,
+    node_id: semanticNodeIdSchema.describe(
+      "SHA-256 of the node kind and identity; stable for one artifact version.",
+    ),
   });
 
 /** One directed semantic relationship before its ID is derived. */
@@ -233,11 +233,10 @@ export const javaScriptSemanticRelationInputSchema = z.strictObject({
 /** One canonical directed semantic relationship. */
 export const javaScriptSemanticRelationSchema =
   javaScriptSemanticRelationInputSchema.extend({
-    relation_id: semanticRelationIdSchema,
-    identifier_strategy: z.strictObject({
-      strategy: z.literal("semantic-content-sha256"),
-      stability: z.literal("relationship-exact"),
-    }),
+    evidence: javaScriptSemanticEvidenceReferenceSchema,
+    relation_id: semanticRelationIdSchema.describe(
+      "SHA-256 of the exact relation content, including its evidence reference.",
+    ),
   });
 
 /** Reasons semantic analysis can leave an explicit frontier. */
@@ -250,8 +249,28 @@ export const JAVASCRIPT_SEMANTIC_UNKNOWN_REASONS = [
   "eval-or-generated-code",
   "incomplete-module",
   "missing-source",
+  "resource-limit",
+  "unknown-value",
   "unsupported-syntax",
 ] as const;
+
+/** Counts examined emission occurrences, including repeats, without retaining discarded IDs. */
+export const javaScriptSemanticUnknownOmissionSchema = z.strictObject({
+  family: z.enum(JAVASCRIPT_SEMANTIC_RELATION_FAMILIES),
+  reason: z.enum(JAVASCRIPT_SEMANTIC_UNKNOWN_REASONS),
+  occurrences: z.int().positive(),
+});
+/** At most one summary row for each finite family/reason pair. */
+export const javaScriptSemanticUnknownOmissionsSchema = z
+  .array(javaScriptSemanticUnknownOmissionSchema)
+  .min(1)
+  .max(
+    JAVASCRIPT_SEMANTIC_RELATION_FAMILIES.length *
+      JAVASCRIPT_SEMANTIC_UNKNOWN_REASONS.length,
+  );
+export type JavaScriptSemanticUnknownOmission = z.infer<
+  typeof javaScriptSemanticUnknownOmissionSchema
+>;
 
 /** One unresolved semantic frontier before its ID is derived. */
 export const javaScriptSemanticUnknownInputSchema = z.strictObject({
@@ -259,7 +278,7 @@ export const javaScriptSemanticUnknownInputSchema = z.strictObject({
   family: z.enum(JAVASCRIPT_SEMANTIC_RELATION_FAMILIES),
   relation_kinds: z.array(z.enum(JAVASCRIPT_SEMANTIC_RELATIONS)).min(1),
   reason: z.enum(JAVASCRIPT_SEMANTIC_UNKNOWN_REASONS),
-  detail: boundedTextSchema,
+  detail: nonEmptyTextSchema,
   candidate_node_ids: z.array(semanticNodeIdSchema),
   evidence: applicationGraphEvidenceSchema,
 });
@@ -267,11 +286,12 @@ export const javaScriptSemanticUnknownInputSchema = z.strictObject({
 /** One canonical unresolved semantic frontier. */
 export const javaScriptSemanticUnknownSchema =
   javaScriptSemanticUnknownInputSchema.extend({
+    evidence: javaScriptSemanticEvidenceReferenceSchema,
     unknown_id: semanticUnknownIdSchema,
   });
 
 const fingerprintComponentsSchema = z.strictObject({
-  parameter_arity: z.number().int().min(0),
+  parameter_arity: z.int().min(0),
   normalized_ast_sha256: digestSchema,
   control_flow_sha256: digestSchema,
   relation_shape_sha256: digestSchema,
@@ -295,13 +315,14 @@ export const javaScriptSemanticFingerprintInputSchema = z.strictObject({
   algorithm: z.literal("rea.javascript-semantic-function"),
   status: z.enum(["complete", "partial", "unavailable"]),
   components: fingerprintComponentsSchema,
-  limitations: z.array(boundedTextSchema),
+  limitations: z.array(nonEmptyTextSchema),
   evidence: applicationGraphEvidenceSchema,
 });
 
 /** One canonical function fingerprint record. */
 export const javaScriptSemanticFingerprintSchema =
   javaScriptSemanticFingerprintInputSchema.extend({
+    evidence: javaScriptSemanticEvidenceReferenceSchema,
     fingerprint_id: prefixedDigestSchema("jsrg_fingerprint"),
     fingerprint_sha256: digestSchema,
   });
@@ -309,20 +330,22 @@ export const javaScriptSemanticFingerprintSchema =
 const familyCoverageSchema = z.strictObject({
   family: z.enum(JAVASCRIPT_SEMANTIC_RELATION_FAMILIES),
   status: z.enum(["complete", "partial", "unknown", "unsupported"]),
-  retained_relations: z.number().int().min(0),
-  omitted_relations: z.number().int().min(0).nullable(),
+  retained_relations: z.int().min(0),
+  omitted_relations: z.int().min(0).nullable(),
   unknown_ids: z.array(semanticUnknownIdSchema),
 });
 
 const graphCoverageSchema = z.strictObject({
   status: z.enum(["complete", "partial", "unknown", "unavailable"]),
   truncated: z.boolean(),
-  omitted_nodes: z.number().int().min(0).nullable(),
-  omitted_relations: z.number().int().min(0).nullable(),
+  omitted_unknown_occurrences:
+    javaScriptSemanticUnknownOmissionsSchema.exactOptional(),
+  omitted_nodes: z.int().min(0).nullable(),
+  omitted_relations: z.int().min(0).nullable(),
   limits: z.array(
     z.strictObject({
       name: z.string().min(1),
-      value: z.number().int().min(0),
+      value: z.int().min(0),
       unit: z.enum(["items", "bytes", "milliseconds", "depth", "other"]),
     }),
   ),
@@ -335,12 +358,13 @@ export const javaScriptSemanticGraphInputSchema = z.strictObject({
   root_artifact_sha256: digestSchema,
   application_graph_id: prefixedDigestSchema("jag"),
   root_node_ids: z.array(semanticNodeIdSchema).min(1),
+  evidence_contexts: z.array(javaScriptSemanticEvidenceContextSchema),
   nodes: z.array(javaScriptSemanticNodeSchema).min(1),
   relations: z.array(javaScriptSemanticRelationSchema),
   fingerprints: z.array(javaScriptSemanticFingerprintSchema),
   unknowns: z.array(javaScriptSemanticUnknownSchema),
   coverage: graphCoverageSchema,
-  limitations: z.array(boundedTextSchema),
+  limitations: z.array(nonEmptyTextSchema),
 });
 
 /** Stored JavaScript Semantic Relation Graph. */
@@ -353,6 +377,14 @@ export const javaScriptSemanticGraphRecordSchema =
 export type JavaScriptSemanticGraphNode = z.infer<
   typeof javaScriptSemanticNodeSchema
 >;
+/** Compact provenance on one graph fact. */
+export type JavaScriptSemanticEvidenceReference = z.infer<
+  typeof javaScriptSemanticEvidenceReferenceSchema
+>;
+/** Content-addressed graph-level provenance context. */
+export type JavaScriptSemanticEvidenceContext = z.infer<
+  typeof javaScriptSemanticEvidenceContextSchema
+>;
 /** Canonical semantic relation. */
 export type JavaScriptSemanticGraphRelation = z.infer<
   typeof javaScriptSemanticRelationSchema
@@ -360,6 +392,10 @@ export type JavaScriptSemanticGraphRelation = z.infer<
 /** Canonical unresolved semantic frontier. */
 export type JavaScriptSemanticGraphUnknown = z.infer<
   typeof javaScriptSemanticUnknownSchema
+>;
+/** Canonical function fingerprint with a compact evidence reference. */
+export type JavaScriptSemanticFingerprint = z.infer<
+  typeof javaScriptSemanticFingerprintSchema
 >;
 /** Canonical graph content before graph ID derivation. */
 export type JavaScriptSemanticGraphInput = z.infer<

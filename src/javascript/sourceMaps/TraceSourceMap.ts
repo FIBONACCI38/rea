@@ -1,3 +1,8 @@
+import {
+  WEB_SOURCE_MAP_LIMITS,
+  sourceMapLimitRecovery,
+  type SourceMapLimits,
+} from "../../domain/sourceMapLimits.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { getHeapStatistics } from "node:v8";
@@ -8,11 +13,13 @@ import {
   type SourceMapSegment,
 } from "@jridgewell/trace-mapping";
 import { z } from "zod";
+import { javaScriptRuntime } from "../../domain/runtimeVersion.js";
+import { javaScriptWorkerMemoryLimitBytes } from "../../process/JavaScriptWorkerMemoryLimit.js";
 import { webSourceOffset } from "../../domain/webSourcePosition.js";
+import { resolveJavaScriptSourceMapUrl } from "../../domain/javascript/javascriptSourceMapPaths.js";
 import {
   webSourceMapReportSchema,
   type WebSourceMapReport,
-  WEB_SOURCE_MAP_LIMITS,
 } from "../../domain/webSourceLocation.js";
 import type { WebSourcePosition } from "../../domain/webSourcePosition.js";
 import {
@@ -20,15 +27,43 @@ import {
   SourceMapFormatFailure,
   type SourceMapSourceDeclaration,
 } from "./SourceMapFormat.js";
+import { decodeValidatedSourceMapLeaves } from "./DecodedSourceMap.js";
 
 /** Decode with the pinned upstream codec; preserve every equal-position candidate. */
 export const traceSourceMap = (
   text: string,
   url: string,
   position: WebSourcePosition,
+  limits: SourceMapLimits = WEB_SOURCE_MAP_LIMITS,
 ): WebSourceMapReport => {
-  const inspected = inspectSourceMap(text);
-  const { map, rows } = decodeValidatedMap(inspected, url);
+  const inspected = inspectSourceMap(text, { limits });
+  const decodedLeaves = decodeValidatedSourceMapLeaves(inspected.leaves, url);
+  let map: TraceMap;
+  if (inspected.format === "regular") {
+    const decoded = decodedLeaves[0];
+    if (decoded === undefined)
+      throw new SourceMapFormatFailure(
+        "format",
+        "Regular source map has no validated leaf.",
+      );
+    map = decoded.map;
+  } else {
+    map = new AnyMap(
+      {
+        version: 3,
+        sections: decodedLeaves.map(({ leaf, map: sectionMap }) => ({
+          offset: leaf.offset,
+          map: sectionMap,
+        })),
+      },
+      url,
+    );
+  }
+  const rows =
+    inspected.format === "regular"
+      ? (decodedLeaves[0]?.rows ?? [])
+      : decodedMappings(map);
+  validateFlattenedRows(inspected, rows, map);
   const matched = greatestPosition(rows, position);
   const segments =
     matched === null
@@ -39,12 +74,12 @@ export const traceSourceMap = (
   let bytes = 0;
   const matches: WebSourceMapReport["matches"] = [];
   for (const segment of segments) {
-    const match = originalMatch(segment, map, inspected.declarations);
+    const match = originalMatch(segment, map, url, inspected.declarations);
     bytes += Buffer.byteLength(JSON.stringify(match)) + 1;
-    if (bytes > WEB_SOURCE_MAP_LIMITS.outputBytes)
+    if (bytes > limits.outputBytes)
       throw new SourceMapFormatFailure(
         "limit",
-        "Complete source-map point evidence exceeds the 32 MiB output budget; no partial evidence was returned.",
+        `Complete source-map point evidence exceeds output admission; no partial evidence was returned. ${sourceMapLimitRecovery("output_bytes", limits.outputBytes)}`,
       );
     matches.push(match);
   }
@@ -54,15 +89,29 @@ export const traceSourceMap = (
   const version = z
     .object({ version: z.string().min(1) })
     .parse(metadata).version;
+  const runtime = javaScriptRuntime(process.versions);
   return webSourceMapReportSchema.parse({
     source_map_sha256: createHash("sha256").update(text).digest("hex"),
     url_context: url,
     engine: { id: "jridgewell-trace-mapping", version },
-    runtime: {
-      id: "node-v8",
-      version: process.version,
-      v8_heap_limit_bytes: getHeapStatistics().heap_size_limit,
-    },
+    // Bun reports V8-shaped heap statistics but ignores the codec's heap flags.
+    // Its launcher applies the same runtime policy, and the parent verifies it.
+    runtime:
+      runtime.id === "node"
+        ? {
+            id: "node-v8",
+            version: process.version,
+            v8_heap_limit_bytes: getHeapStatistics().heap_size_limit,
+          }
+        : {
+            id: "bun",
+            version: runtime.version,
+            node_compatibility_version: runtime.nodeCompatibilityVersion,
+            v8_heap_limit_bytes: null,
+            process_memory_limit_bytes: javaScriptWorkerMemoryLimitBytes(
+              limits.codecHeapMiB,
+            ),
+          },
     format: inspected.format,
     reported_file: inspected.reportedFile,
     lookup: {
@@ -77,49 +126,14 @@ export const traceSourceMap = (
   });
 };
 
-const decodeValidatedMap = (
+const validateFlattenedRows = (
   inspected: ReturnType<typeof inspectSourceMap>,
-  url: string,
-) => {
-  let regularRows: ReturnType<typeof decodedMappings> | undefined;
-  for (const leaf of inspected.leaves) {
-    const decoded = decodedMappings(
-      new TraceMap(JSON.stringify(leaf.map), url),
-    );
-    if (inspected.format === "regular") regularRows = decoded;
-    for (const [line, row] of decoded.entries())
-      for (const segment of row) {
-        if (
-          segment.some((value) => !Number.isSafeInteger(value) || value < 0) ||
-          (segment.length !== 1 && segment[1] >= leaf.map.sources.length) ||
-          (segment.length === 5 && segment[4] >= leaf.map.names.length)
-        )
-          throw new SourceMapFormatFailure(
-            "format",
-            "Decoded section-local position, source index or name index is invalid.",
-          );
-        const generatedLine = leaf.offset.line + line;
-        const generatedColumn =
-          segment[0] + (line === 0 ? leaf.offset.column : 0);
-        if (
-          leaf.stop !== null &&
-          (generatedLine > leaf.stop.line ||
-            (generatedLine === leaf.stop.line &&
-              generatedColumn >= leaf.stop.column))
-        )
-          throw new SourceMapFormatFailure(
-            "format",
-            "Embedded source-map mappings overlap the following section boundary.",
-          );
-      }
-  }
-  const map = new AnyMap(inspected.jsonText, url);
-  const rows = regularRows ?? decodedMappings(map);
+  rows: ReturnType<typeof decodedMappings>,
+  map: ReturnType<typeof AnyMap>,
+): void => {
   for (const row of rows)
     for (const segment of row) {
       if (
-        ![1, 4, 5].includes(segment.length) ||
-        segment.some((v) => !Number.isSafeInteger(v) || v < 0) ||
         (segment.length !== 1 && segment[1] >= inspected.declarations.length) ||
         (segment.length === 5 && segment[4] >= map.names.length)
       )
@@ -128,8 +142,6 @@ const decodeValidatedMap = (
           "Decoded mapping has invalid component count, position, source index or name index.",
         );
     }
-
-  return { map, rows };
 };
 
 const greatestPosition = (
@@ -152,6 +164,7 @@ const greatestPosition = (
 const originalMatch = (
   segment: Readonly<SourceMapSegment>,
   map: TraceMap,
+  mapUrl: string,
   declarations: readonly SourceMapSourceDeclaration[],
 ): WebSourceMapReport["matches"][number] => {
   if (segment.length === 1) return { state: "generated-only" };
@@ -173,10 +186,11 @@ const originalMatch = (
     source_index: declaration.sourceIndex,
     reported_source: declaration.source,
     reported_source_root: declaration.root,
-    resolved_url:
-      declaration.source === null
-        ? null
-        : (map.resolvedSources[segment[1]] ?? null),
+    resolved_url: resolveJavaScriptSourceMapUrl(
+      declaration.source,
+      declaration.root,
+      mapUrl,
+    ),
     ignored: declaration.ignored,
     content:
       declaration.content === null

@@ -5,50 +5,83 @@ import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 
-import { ArtifactProvider } from "../../../../src/artifacts/ArtifactProvider.js";
+import { parseBinaryTarget } from "../../../../src/application/BinaryTargetResolver.js";
+import {
+  CPU,
+  machoImage,
+} from "../../../../src/artifacts/apple/MachoImage.fixture.js";
 import { artifactExtractionExecutionSchema } from "../../../../src/contracts/artifactToolContracts.js";
-import { TOOL_EFFECTS } from "../../../../src/contracts/toolEffects.js";
 import {
   artifactExtractionResultSchema,
   artifactInventoryResultSchema,
 } from "../../../../src/domain/artifactGraph.js";
-import type { BinaryTarget } from "../../../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
+import {
+  createOwnedArtifactClient,
+  withArtifactClient,
+} from "../../../support/artifactClientScope.js";
 
 describe("artifact extraction", () => {
-  it("declares possible native mounts and fresh extraction directories", () => {
-    for (const platform of ["linux", "darwin"] as const) {
-      const provider = new ArtifactProvider(platform);
-      for (const operation of [
-        "inventory_artifact",
-        "inspect_artifact",
-        "extract_artifact",
-      ] as const) {
+  it.skipIf(process.platform === "win32").each(["file/..", "missing"])(
+    "refuses an invalid parent (%s) before acquiring output and permits a corrected request",
+    async (parent) => {
+      const root = await createTestTempDirectory("rea-extract-invalid-parent-");
+      const source = join(root, "source.app");
+      await mkdir(source);
+      await writeFile(join(source, "payload.txt"), "selected payload\n");
+      await writeFile(join(root, "file"), "parent is a file");
+      const output = join(root, "out");
+
+      await withArtifactClient(await target(source), async (client) => {
+        const refused = await client.execute("extract_artifact", {
+          output_root: `${root}/${parent}/out`,
+        });
+        expect(refused).toMatchObject({
+          ok: false,
+          error: { _tag: "ArtifactOperationError", reason: "path" },
+        });
+        if (!refused.ok) expect(refused.error.cleanupIncomplete).toBe(false);
+        await expect(access(output)).rejects.toMatchObject({ code: "ENOENT" });
+
+        const corrected = await client.execute("extract_artifact", {
+          output_root: output,
+        });
+        if (!corrected.ok) throw corrected.error;
         expect(
-          provider
-            .capabilities()
-            .find((capability) => capability.operation === operation)?.effects,
-        ).toMatchObject({ launchesProcess: true, mayWriteFilesystem: true });
-      }
-    }
-    expect(TOOL_EFFECTS.inspect_artifact).toMatchObject({
-      launchesProcess: true,
-      writesFilesystem: true,
-      mutatesTarget: false,
+          artifactExtractionResultSchema.parse(corrected.value.result),
+        ).toMatchObject({ output_root: output, containment_verified: true });
+        expect(await readFile(join(output, "payload.txt"), "utf8")).toBe(
+          "selected payload\n",
+        );
+      });
+    },
+  );
+
+  it("keeps committed files after the owning client closes", async () => {
+    const root = await createTestTempDirectory("rea-extract-client-close-");
+    const source = join(root, "source.app");
+    await mkdir(source);
+    await writeFile(join(source, "payload.txt"), "committed\n");
+    const output = join(root, "output");
+    const client = createOwnedArtifactClient(await target(source));
+
+    const result = await client.execute("extract_artifact", {
+      output_root: output,
     });
-    expect(TOOL_EFFECTS.extract_artifact).toMatchObject({
-      launchesProcess: true,
-      writesFilesystem: true,
-      idempotent: false,
-      mutatesTarget: false,
-    });
+    if (!result.ok) throw result.error;
+    expect((await client.close()).ok).toBe(true);
+    expect(await readFile(join(output, "payload.txt"), "utf8")).toBe(
+      "committed\n",
+    );
   });
+
   it("extracts all regular occurrences through an exclusively owned output tree", async () => {
     const root = await createTestTempDirectory("rea-extract-");
-    const source = join(root, "source");
+    const source = join(root, "source.app");
     await mkdir(join(source, "assets"), { recursive: true });
     await writeFile(join(source, "assets", "selected.js"), "selected();\n");
     await writeFile(join(source, "assets", "ignored.js"), "ignored();\n");
-    const targetValue = target(source, "directory");
+    const targetValue = await target(source);
     const graph = await inventory(targetValue);
     expect(
       graph.occurrences.some(
@@ -58,31 +91,26 @@ describe("artifact extraction", () => {
     const cancelledOutput = join(root, "cancelled-output");
     const controller = new AbortController();
     controller.abort();
-    const cancelled = await new ArtifactProvider()
-      .createClient(targetValue)
-      .execute(
-        "extract_artifact",
-        artifactExtractionExecutionSchema.parse({
-          output_root: cancelledOutput,
-        }),
-        { signal: controller.signal },
-      );
+    const cancelled = await createOwnedArtifactClient(targetValue).execute(
+      "extract_artifact",
+      artifactExtractionExecutionSchema.parse({
+        output_root: cancelledOutput,
+      }),
+      { signal: controller.signal },
+    );
     expect(cancelled).toMatchObject({
       ok: false,
       error: { _tag: "ArtifactOperationError", reason: "cancelled" },
     });
     await expect(access(cancelledOutput)).rejects.toThrow();
     const output = join(root, "output");
-    const result = await new ArtifactProvider()
-      .createClient(targetValue)
-      .execute(
-        "extract_artifact",
-        artifactExtractionExecutionSchema.parse({
-          output_root: output,
-        }),
-      );
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    const result = await createOwnedArtifactClient(targetValue).execute(
+      "extract_artifact",
+      artifactExtractionExecutionSchema.parse({
+        output_root: output,
+      }),
+    );
+    if (!result.ok) throw result.error;
     const firstExtraction = artifactExtractionResultSchema.parse(
       result.value.result,
     );
@@ -94,6 +122,8 @@ describe("artifact extraction", () => {
       ]),
       extraction_manifest: { output_root_alias: "$OUTPUT_ROOT" },
     });
+    // artifacts names every extracted path; the Evidence does not repeat them.
+    expect(result.value.locations).toEqual([]);
     expect(await readFile(join(output, "assets", "selected.js"), "utf8")).toBe(
       "selected();\n",
     );
@@ -102,29 +132,24 @@ describe("artifact extraction", () => {
     );
 
     const relocatedOutput = join(root, "relocated-output");
-    const relocated = await new ArtifactProvider()
-      .createClient(targetValue)
-      .execute(
-        "extract_artifact",
-        artifactExtractionExecutionSchema.parse({
-          output_root: relocatedOutput,
-        }),
-      );
-    expect(relocated.ok).toBe(true);
-    if (!relocated.ok) return;
+    const relocated = await createOwnedArtifactClient(targetValue).execute(
+      "extract_artifact",
+      artifactExtractionExecutionSchema.parse({
+        output_root: relocatedOutput,
+      }),
+    );
+    if (!relocated.ok) throw relocated.error;
     expect(
       artifactExtractionResultSchema.parse(relocated.value.result)
         .extraction_manifest,
     ).toEqual(firstExtraction.extraction_manifest);
 
-    const second = await new ArtifactProvider()
-      .createClient(targetValue)
-      .execute(
-        "extract_artifact",
-        artifactExtractionExecutionSchema.parse({
-          output_root: output,
-        }),
-      );
+    const second = await createOwnedArtifactClient(targetValue).execute(
+      "extract_artifact",
+      artifactExtractionExecutionSchema.parse({
+        output_root: output,
+      }),
+    );
     expect(second).toMatchObject({
       ok: false,
       error: { _tag: "ArtifactOperationError", reason: "path" },
@@ -132,25 +157,28 @@ describe("artifact extraction", () => {
     expect((await readdir(root)).sort()).toEqual([
       "output",
       "relocated-output",
-      "source",
+      "source.app",
     ]);
   });
 });
 const inventory = async (targetValue: BinaryTarget) => {
-  const result = await new ArtifactProvider()
-    .createClient(targetValue)
-    .execute("inventory_artifact", {});
+  const result = await createOwnedArtifactClient(targetValue).execute(
+    "inventory_artifact",
+    {},
+  );
   if (!result.ok) throw result.error;
   return artifactInventoryResultSchema.parse(result.value.result);
 };
 
-const target = (
-  path: string,
-  format: Extract<BinaryTarget, { kind: "archive" }>["format"] | "directory",
-): BinaryTarget => ({
-  path,
-  sourcePath: path,
-  sha256: "0".repeat(64),
-  kind: "archive",
-  format: format === "directory" ? "asar" : format,
-});
+/** A real bundle target has an executable identity distinct from its resource tree. */
+const target = async (path: string): Promise<BinaryTarget> => {
+  await writeFile(
+    join(path, "Info.plist"),
+    '<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Main</string></dict></plist>',
+  );
+  await writeFile(join(path, "Main"), machoImage({ cpu: CPU.arm64 }));
+  const parsed = await parseBinaryTarget(path);
+  if (!parsed.ok) throw parsed.error;
+  expect(parsed.value.bundleInfoPlist).toBe(join(path, "Info.plist"));
+  return parsed.value;
+};

@@ -7,25 +7,19 @@ import { inspectManagedArtifactBytes } from "../../../dist/dotnet/ManagedArtifac
 import { inspectManagedMembersBytes } from "../../../dist/dotnet/ManagedMemberInspector.js";
 import { inspectManagedNativeBoundariesBytes } from "../../../dist/dotnet/ManagedNativeBoundaryInspector.js";
 import { compareManagedMemberPaths } from "../../../dist/application/managed/ManagedMemberComparisonService.js";
-import { verifyManagedNativeBoundariesEvidence } from "../../../dist/application/managed/ManagedNativeVerificationService.js";
+import { executeManagedNativeBoundaries } from "../../../dist/application/managed/ManagedNativeVerificationService.js";
 import { importManagedReconstructionEvidence } from "../../../dist/application/managed/ManagedReconstructionService.js";
 import { projectManagedApplicationGraphEvidence } from "../../../dist/application/managed/ManagedApplicationGraphService.js";
 import { traceApplicationFeatureEvidence } from "../../../dist/application/javascript/JavaScriptApplicationWorkflowService.js";
-import { MANAGED_STATIC_PROVIDER } from "../../../dist/application/InvestigationProviders.js";
+import { MANAGED_STATIC_PROVIDER } from "../../../dist/domain/investigationProviders.js";
 import { createEvidence } from "../../../dist/domain/evidence.js";
+import { functionDossier } from "../../fixtures/managed/function-dossier.mjs";
 import {
   alternateMvid,
   buildNativePeFixture,
 } from "../../fixtures/managed/pe.mjs";
 import { createManagedConformanceSupport } from "./support.mjs";
-import {
-  comparisonLimits,
-  defaultIlBody,
-  functionDossier,
-  inspectionLimits,
-  memberLimits,
-  nativeBoundaryLimits,
-} from "./config.mjs";
+import { defaultIlBody } from "./config.mjs";
 import { createManagedCompletionReport } from "./completion-report.mjs";
 import {
   completeVerifierRun,
@@ -34,6 +28,8 @@ import {
 
 const verifierRun = createVerifierRun();
 const workspace = await mkdtemp(join(tmpdir(), "rea-managed-conformance-"));
+let completionReportInput;
+let finalReport;
 const {
   fixture,
   fixtureBytes,
@@ -43,8 +39,6 @@ const {
   sha256,
 } = createManagedConformanceSupport({
   workspace,
-  inspectionLimits,
-  memberLimits,
   defaultIlBody,
 });
 
@@ -56,7 +50,6 @@ try {
   const modernArtifact = inspectManagedArtifactBytes(
     modern.bytes,
     modern.target,
-    inspectionLimits,
   );
   assert.equal(modernArtifact.classification.status, "managed");
   assert.equal(modernArtifact.classification.runtime_family, "modern-dotnet");
@@ -81,7 +74,6 @@ try {
   const frameworkArtifact = inspectManagedArtifactBytes(
     framework.bytes,
     framework.target,
-    inspectionLimits,
   );
   assert.equal(
     frameworkArtifact.classification.runtime_family,
@@ -91,7 +83,6 @@ try {
   const frameworkBoundaries = inspectManagedNativeBoundariesBytes(
     framework.bytes,
     framework.target,
-    nativeBoundaryLimits,
   );
   assert.equal(frameworkBoundaries.pinvoke_imports.length, 1);
   assert.equal(
@@ -106,14 +97,13 @@ try {
   const frameworkMembers = inspectManagedMembersBytes(
     framework.bytes,
     framework.target,
-    memberLimits,
   );
   const frameworkArtifactEvidence = createEvidence(
     framework.target,
     MANAGED_STATIC_PROVIDER,
     {
       operation: "inspect_managed_artifact",
-      parameters: inspectionLimits,
+      parameters: {},
       result: frameworkArtifact,
       rawResult: null,
       limitations: frameworkArtifact.limitations,
@@ -125,7 +115,7 @@ try {
     MANAGED_STATIC_PROVIDER,
     {
       operation: "inspect_managed_members",
-      parameters: memberLimits,
+      parameters: {},
       result: frameworkMembers,
       rawResult: null,
       limitations: frameworkMembers.limitations,
@@ -137,7 +127,7 @@ try {
     MANAGED_STATIC_PROVIDER,
     {
       operation: "inspect_managed_native_boundaries",
-      parameters: nativeBoundaryLimits,
+      parameters: {},
       result: frameworkBoundaries,
       rawResult: null,
       limitations: frameworkBoundaries.limitations,
@@ -166,12 +156,15 @@ try {
       locations: [{ kind: "address", address: "0x401000" }],
     },
   );
-  const nativeVerification = verifyManagedNativeBoundariesEvidence({
+  const nativeVerification = executeManagedNativeBoundaries({
     managed_boundaries: frameworkBoundaryEvidence,
     native_observations: [nativeFunctionEvidence],
   });
   assert.equal(nativeVerification.ok, true);
-  assert.equal(nativeVerification.value.normalized_result.summary.verified, 1);
+  assert.equal(
+    nativeVerification.value.evidence.normalized_result.summary.verified,
+    1,
+  );
   const applicationGraph = projectManagedApplicationGraphEvidence({
     managed_artifact: frameworkArtifactEvidence,
     managed_members: frameworkMemberEvidence,
@@ -200,10 +193,7 @@ try {
     direction: "incoming",
   });
   assert.equal(applicationTrace.ok, true);
-  assert.equal(
-    applicationTrace.value.normalized_result.summary.matched_seeds,
-    1,
-  );
+  assert.equal(applicationTrace.value.result.summary.matched_seeds, 1);
 
   const readyToRun = await fixture("r2r-x64.exe", {
     machine: 0x8664,
@@ -219,7 +209,6 @@ try {
   const r2rArtifact = inspectManagedArtifactBytes(
     readyToRun.bytes,
     readyToRun.target,
-    inspectionLimits,
   );
   assert.equal(r2rArtifact.pe.architecture, "x86_64");
   assert.equal(
@@ -229,7 +218,6 @@ try {
   const r2rBoundaries = inspectManagedNativeBoundariesBytes(
     readyToRun.bytes,
     readyToRun.target,
-    nativeBoundaryLimits,
   );
   assert.equal(r2rBoundaries.summary.ready_to_run, true);
   assert.equal(r2rBoundaries.native_implementations[0]?.code_type, "native");
@@ -246,7 +234,6 @@ try {
   const obfuscatedMembers = inspectManagedMembersBytes(
     obfuscated.bytes,
     obfuscated.target,
-    memberLimits,
   );
   assert.equal(obfuscatedMembers.types[0]?.full_name, "Fixture.ꙮType");
   assert.equal(obfuscatedMembers.methods[0]?.name, "λ⛧");
@@ -307,11 +294,6 @@ try {
   const comparison = await compareManagedMemberPaths({
     leftPath: left.path,
     rightPath: right.path,
-    memberLimits: {
-      maxFileBytes: 1024 * 1024,
-      ...memberLimits,
-    },
-    comparisonLimits,
   });
   assert.equal(comparison.ok, true);
   const comparisonResult = comparison.value.normalized_result;
@@ -339,11 +321,6 @@ try {
   const partialBodyComparison = await compareManagedMemberPaths({
     leftPath: unavailableBodyLeft.path,
     rightPath: unavailableBodyRight.path,
-    memberLimits: {
-      maxFileBytes: 1024 * 1024,
-      ...memberLimits,
-    },
-    comparisonLimits,
   });
   assert.equal(partialBodyComparison.ok, true);
   const partialBodyMethod =
@@ -361,7 +338,6 @@ try {
   const nativeResult = inspectManagedArtifactBytes(
     nativeOnly.bytes,
     nativeOnly.target,
-    inspectionLimits,
   );
   assert.equal(nativeResult.classification.status, "not-managed");
 
@@ -371,72 +347,67 @@ try {
   const malformedResult = inspectManagedArtifactBytes(
     malformed.bytes,
     malformed.target,
-    inspectionLimits,
   );
   assert.equal(malformedResult.classification.status, "malformed");
 
   const manifestSelfTest = await runManagedAppManifestSelfTest();
   const operatorManifest = await runOptionalManagedAppManifest();
   const ilspyOracle = await runOptionalIlspyOracle();
-  const completionReport = createManagedCompletionReport(
-    {
-      modern,
-      framework,
-      nativeFunctionTarget,
-      readyToRun,
-      obfuscated,
-      left,
-      right,
-      nativeOnly,
-      malformed,
-      manifestSelfTest,
-      operatorManifest,
-      ilspyOracle,
+  completionReportInput = {
+    modern,
+    framework,
+    nativeFunctionTarget,
+    readyToRun,
+    obfuscated,
+    left,
+    right,
+    nativeOnly,
+    malformed,
+    manifestSelfTest,
+    operatorManifest,
+    ilspyOracle,
+  };
+  finalReport = {
+    verified:
+      11 + (operatorManifest === null ? 0 : 1) + (ilspyOracle === null ? 0 : 1),
+    managedSurfaces: [
+      "inspect_managed_artifact",
+      "inspect_managed_members",
+      "inspect_managed_native_boundaries",
+      "compare_managed_members",
+      "verify_managed_native_boundaries",
+      "import_managed_reconstruction",
+      "project_managed_application_graph",
+    ],
+    coverage: [
+      "modern-dotnet-anycpu",
+      "dotnet-framework-x86-pinvoke",
+      "x64-ready-to-run-native-body",
+      "managed-native-verification",
+      "managed-application-graph-projection",
+      "unicode-obfuscated-identifiers",
+      "decompiler-reconstruction-import",
+      "mvid-and-token-drift",
+      "not-managed",
+      "malformed-metadata",
+      "operator-local-managed-manifest",
+      ...(ilspyOracle === null ? [] : ["ilspy-reconstruction-oracle"]),
+    ],
+    managedAppManifest: {
+      env: "REA_MANAGED_APP_MANIFEST_PATH",
+      selfTest: manifestSelfTest,
+      operator: operatorManifest ?? { configured: false },
     },
-    await completeVerifierRun(verifierRun),
-  );
-
-  process.stdout.write(
-    `${JSON.stringify({
-      verified:
-        11 +
-        (operatorManifest === null ? 0 : 1) +
-        (ilspyOracle === null ? 0 : 1),
-      managedSurfaces: [
-        "inspect_managed_artifact",
-        "inspect_managed_members",
-        "inspect_managed_native_boundaries",
-        "compare_managed_members",
-        "verify_managed_native_boundaries",
-        "import_managed_reconstruction",
-        "project_managed_application_graph",
-      ],
-      coverage: [
-        "modern-dotnet-anycpu",
-        "dotnet-framework-x86-pinvoke",
-        "x64-ready-to-run-native-body",
-        "managed-native-verification",
-        "managed-application-graph-projection",
-        "unicode-obfuscated-identifiers",
-        "decompiler-reconstruction-import",
-        "mvid-and-token-drift",
-        "not-managed",
-        "malformed-metadata",
-        "operator-local-managed-manifest",
-        ...(ilspyOracle === null ? [] : ["ilspy-reconstruction-oracle"]),
-      ],
-      managedAppManifest: {
-        env: "REA_MANAGED_APP_MANIFEST_PATH",
-        selfTest: manifestSelfTest,
-        operator: operatorManifest ?? { configured: false },
-      },
-      ilspyOracle: ilspyOracle ?? {
-        env: "REA_ILSPY_CMD_PATH",
-        configured: false,
-      },
-      completionReport,
-    })}\n`,
-  );
+    ilspyOracle: ilspyOracle ?? {
+      env: "REA_ILSPY_CMD_PATH",
+      configured: false,
+    },
+  };
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
+finalReport.completionReport = createManagedCompletionReport(
+  completionReportInput,
+  await completeVerifierRun(verifierRun),
+);
+process.stdout.write(`${JSON.stringify(finalReport)}\n`);

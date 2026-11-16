@@ -1,9 +1,9 @@
 import type {
   JavaScriptBindingProvenance,
   JavaScriptModuleOrigin,
-  JavaScriptSemanticPrimitive,
 } from "./javascriptSemanticIr.js";
-import { compareCodePoints } from "../canonicalOrdering.js";
+import type { JavaScriptSemanticPrimitive } from "./javascriptSemanticValueTypes.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 
 /** Construct exact local provenance without inventing module origins. */
 export const semanticLocalProvenance = (): JavaScriptBindingProvenance => ({
@@ -30,9 +30,16 @@ export const semanticOriginsProvenance = (
 ): JavaScriptBindingProvenance => {
   const unique = uniqueSemanticOrigins(origins);
   const origin = unique[0];
-  return unique.length === 1 && origin !== undefined
+  return unique.length === 1 &&
+    origin !== undefined &&
+    origin.loaderAuthority !== "candidate"
     ? { status: "module", origins: [origin], reason: null }
-    : semanticAmbiguousProvenance(unique, "Multiple module origins.");
+    : semanticAmbiguousProvenance(
+        unique,
+        unique.some(({ loaderAuthority }) => loaderAuthority === "candidate")
+          ? "CommonJS loader authority is unknown."
+          : "Multiple module origins.",
+      );
 };
 
 /** Deduplicate and canonically order module origins. */
@@ -44,11 +51,16 @@ export const uniqueSemanticOrigins = (
       origins.map((origin) => [semanticOriginKey(origin), origin]),
     ).values(),
   ].sort((left, right) =>
-    compareCodePoints(semanticOriginKey(left), semanticOriginKey(right)),
+    compareUnicodeCodePoints(semanticOriginKey(left), semanticOriginKey(right)),
   );
 
 const semanticOriginKey = (origin: JavaScriptModuleOrigin): string =>
-  `${origin.specifier}\0${origin.importedPath.join("\0")}`;
+  JSON.stringify([
+    origin.specifier,
+    origin.importedPath,
+    origin.resolutionMode ?? "import",
+    origin.loaderAuthority ?? "proven",
+  ]);
 
 /** Canonically distinguish primitive values across type boundaries. */
 export const semanticPrimitiveKey = (

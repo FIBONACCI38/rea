@@ -4,7 +4,10 @@ import { fc, it } from "@fast-check/vitest";
 import canonicalize from "canonicalize";
 import { describe, expect } from "vitest";
 
-import { digestCanonicalValue } from "./canonicalDigest.js";
+import {
+  CanonicalDigestError,
+  digestCanonicalValue,
+} from "./canonicalDigest.js";
 
 const legacyDigest = (value: unknown): string => {
   const encoded = canonicalize(value);
@@ -25,6 +28,7 @@ describe("incremental canonical digest", () => {
     const sparse: unknown[] = [undefined, Symbol("omit"), () => undefined];
     sparse.length = 6;
     const fixtures: unknown[] = [
+      { "\uE000": "BMP", "\u{10000}": "supplementary" },
       {
         "€": "\ud800",
         "😀": "\udc00",
@@ -51,21 +55,33 @@ describe("incremental canonical digest", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     const recursiveJson = { toJSON: (): unknown => recursiveJson };
-    for (const value of [NaN, Infinity, -Infinity, 1n, cyclic, recursiveJson])
-      expect(() => digestCanonicalValue(value)).toThrow();
+    for (const [value, code] of [
+      [Number.NaN, "nan"],
+      [Number.POSITIVE_INFINITY, "infinity"],
+      [Number.NEGATIVE_INFINITY, "infinity"],
+      [cyclic, "circular"],
+      [recursiveJson, "circular"],
+    ] as const) {
+      let failure: unknown;
+      try {
+        digestCanonicalValue(value);
+      } catch (cause) {
+        failure = cause;
+      }
+      expect(failure).toBeInstanceOf(CanonicalDigestError);
+      expect(failure).toMatchObject({ _tag: "CanonicalDigestError", code });
+    }
+    expect(() => digestCanonicalValue(1n)).toThrow();
   });
 
-  it("hashes repeated large leaves with the same byte sequence", () => {
-    const value = {
-      payload: Array.from({ length: 64 }, () => "x".repeat(16_384)),
-    };
-    expect(digestCanonicalValue(value)).toBe(legacyDigest(value));
-  });
-
-  it("keeps digests identical when buffered parts cross flush boundaries", () => {
+  it("preserves canonical bytes across large keys, repeated leaves and buffer flushes", () => {
     const manyKeys: Record<string, unknown> = {};
     for (let i = 0; i < 2000; i += 1) manyKeys[`k${i}`] = i;
-    const value = { keys: manyKeys, tail: ["€", "😀", "x".repeat(9000)] };
+    const value = {
+      keys: manyKeys,
+      payload: Array.from({ length: 64 }, () => "x".repeat(16_384)),
+      tail: ["€", "😀", "x".repeat(9000)],
+    };
     expect(digestCanonicalValue(value)).toBe(legacyDigest(value));
   });
 

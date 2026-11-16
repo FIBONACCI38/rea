@@ -1,13 +1,16 @@
 import {
   createJavaScriptApplicationEdge,
-  createJavaScriptApplicationGraph,
-  createJavaScriptApplicationNode,
-  type ApplicationEdge,
-  type ApplicationGraphEvidence,
-  type ApplicationNode,
+  createImmutableJavaScriptApplicationGraphSteps,
+  mergeJavaScriptApplicationNodes,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
+import type {
+  ApplicationEdge,
+  ApplicationNode,
+} from "./javascriptApplicationGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "./javascriptApplicationEvidenceSchemas.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { ApplicationVersionComparisonItem } from "./javascriptApplicationVersionComparisonSchemas.js";
 
 interface ChangeGraphInput {
@@ -27,22 +30,16 @@ export interface ApplicationChangeGraphProjection {
 export const buildJavaScriptApplicationChangeGraph = (
   input: ChangeGraphInput,
 ): ApplicationChangeGraphProjection => {
-  const allNodes = nodeCandidates(input);
+  const mergedNodes = mergeJavaScriptApplicationNodes(
+    nodeCandidates(input),
+  ).sort((left, right) =>
+    compareUnicodeCodePoints(left.node_id, right.node_id),
+  );
+  const retained = new Set(mergedNodes.map(({ node_id }) => node_id));
   const preferredRoots = uniqueSorted([
     ...input.right.root_node_ids,
     ...input.left.root_node_ids,
-  ]).filter((nodeId) => allNodes.has(nodeId));
-  const orderedNodeIds = uniqueSorted([
-    ...preferredRoots,
-    ...input.items.flatMap(({ left_node_id: left, right_node_id: right }) => [
-      ...(right === null ? [] : [right]),
-      ...(left === null ? [] : [left]),
-    ]),
-  ]);
-  const retained = new Set(orderedNodeIds);
-  const mergedNodes = mergeNodes(
-    orderedNodeIds.flatMap((nodeId) => allNodes.get(nodeId) ?? []),
-  );
+  ]).filter((nodeId) => retained.has(nodeId));
   const sourceEdges = uniqueEdges([
     ...input.left.edges,
     ...input.right.edges,
@@ -50,13 +47,19 @@ export const buildJavaScriptApplicationChangeGraph = (
     ({ source_node_id: source, target_node_id: target }) =>
       retained.has(source) && retained.has(target),
   );
+  const leftById = new Map(
+    input.left.nodes.map((node) => [node.node_id, node]),
+  );
+  const rightById = new Map(
+    input.right.nodes.map((node) => [node.node_id, node]),
+  );
   const comparisonEdges = input.items.flatMap((item) =>
-    changedFromEdge(item, input, retained),
+    changedFromEdge(item, input, retained, leftById, rightById),
   );
   const candidateEdges = uniqueEdges([...sourceEdges, ...comparisonEdges]);
   const rootNodeIds = preferredRoots.filter((nodeId) => retained.has(nodeId));
   const fallbackRoot = mergedNodes[0]?.node_id;
-  const graph = createJavaScriptApplicationGraph({
+  const steps = createImmutableJavaScriptApplicationGraphSteps({
     schema: "JavaScriptApplicationGraph",
     root_node_ids:
       rootNodeIds.length > 0
@@ -74,12 +77,12 @@ export const buildJavaScriptApplicationChangeGraph = (
       "The change graph contains compared entities and their retained relationships; it is not an executable application.",
     ]),
   });
-  return { graph };
+  let next = steps.next();
+  while (!next.done) next = steps.next();
+  return { graph: next.value };
 };
 
-const nodeCandidates = (
-  input: ChangeGraphInput,
-): Map<string, ApplicationNode[]> => {
+const nodeCandidates = (input: ChangeGraphInput): ApplicationNode[] => {
   const required = new Set([
     ...input.left.root_node_ids,
     ...input.right.root_node_ids,
@@ -88,23 +91,28 @@ const nodeCandidates = (
       ...(right === null ? [] : [right]),
     ]),
   ]);
-  const output = new Map<string, ApplicationNode[]>();
-  for (const node of [...input.left.nodes, ...input.right.nodes])
-    if (required.has(node.node_id))
-      output.set(node.node_id, [...(output.get(node.node_id) ?? []), node]);
-  return output;
+  return [...input.left.nodes, ...input.right.nodes].filter((node) =>
+    required.has(node.node_id),
+  );
 };
 
 const changedFromEdge = (
   item: ApplicationVersionComparisonItem,
   input: ChangeGraphInput,
   retained: ReadonlySet<string>,
+  leftById: ReadonlyMap<string, ApplicationNode>,
+  rightById: ReadonlyMap<string, ApplicationNode>,
 ): ApplicationEdge[] => {
   const left = item.left_node_id;
   const right = item.right_node_id;
   if (
     item.match.status !== "matched" ||
     item.status === "unchanged" ||
+    // Pairing and uncertainty remain in the item; neither establishes a change.
+    (item.status === "unknown" &&
+      !item.dimensions.some(
+        (dimension) => dimension !== "location" && dimension !== "coverage",
+      )) ||
     left === null ||
     right === null ||
     left === right ||
@@ -112,7 +120,12 @@ const changedFromEdge = (
     !retained.has(right)
   )
     return [];
-  const evidence = comparisonEvidence(item, input);
+  const evidence = comparisonEvidence(
+    item,
+    input,
+    leftById.get(left),
+    rightById.get(right),
+  );
   return [
     createJavaScriptApplicationEdge({
       source_node_id: right,
@@ -133,13 +146,9 @@ const changedFromEdge = (
 const comparisonEvidence = (
   item: ApplicationVersionComparisonItem,
   input: ChangeGraphInput,
+  left: ApplicationNode | undefined,
+  right: ApplicationNode | undefined,
 ): ApplicationGraphEvidence => {
-  const right = input.right.nodes.find(
-    ({ node_id: id }) => id === item.right_node_id,
-  );
-  const left = input.left.nodes.find(
-    ({ node_id: id }) => id === item.left_node_id,
-  );
   const source =
     right?.observations[0]?.evidence ?? left?.observations[0]?.evidence;
   const complete =
@@ -166,7 +175,12 @@ const comparisonEvidence = (
       executable_sha256: null,
     },
     coverage: complete
-      ? { status: "complete", truncated: false, omitted_count: 0, limits: [] }
+      ? {
+          status: "complete",
+          truncated: false,
+          omitted_count: 0,
+          limits: sourceCoverageLimits(input),
+        }
       : {
           status: "partial",
           truncated:
@@ -196,7 +210,7 @@ const changeGraphCoverage = (
       status: "complete",
       truncated: false,
       omitted_count: 0,
-      limits: [],
+      limits: sourceCoverageLimits(input),
     };
   return {
     status: "partial",
@@ -216,43 +230,12 @@ const sourceCoverageLimits = (input: ChangeGraphInput) =>
         (limit) => [`${limit.name}\0${limit.value}\0${limit.unit}`, limit],
       ),
     ).values(),
-  ].sort((left, right) => compareCodePoints(left.name, right.name));
+  ].sort((left, right) => compareUnicodeCodePoints(left.name, right.name));
 
 const combineOmittedCounts = (left: number | null, right: number | null) =>
   left === null || right === null ? null : left + right;
 
-const mergeNodes = (nodes: readonly ApplicationNode[]): ApplicationNode[] => {
-  const groups = new Map<string, ApplicationNode[]>();
-  for (const node of nodes)
-    groups.set(node.node_id, [...(groups.get(node.node_id) ?? []), node]);
-  const merged = [...groups.values()].map((group) => {
-    const first = group[0];
-    if (first === undefined)
-      throw new TypeError("Empty change-graph node group");
-    const observations = [
-      ...new Map(
-        group
-          .flatMap(({ observations: values }) => values)
-          .map((observation) => [observation.observation_id, observation]),
-      ).values(),
-    ].sort((left, right) =>
-      compareCodePoints(left.observation_id, right.observation_id),
-    );
-    return createJavaScriptApplicationNode({
-      kind: first.kind,
-      identity: first.identity,
-      observations: observations.map(
-        ({ observation_id: _id, identifier_strategy: _strategy, ...value }) =>
-          value,
-      ),
-    });
-  });
-  return merged.sort((left, right) =>
-    compareCodePoints(left.node_id, right.node_id),
-  );
-};
-
 const uniqueEdges = (edges: readonly ApplicationEdge[]): ApplicationEdge[] =>
   [...new Map(edges.map((edge) => [edge.edge_id, edge])).values()].sort(
-    (left, right) => compareCodePoints(left.edge_id, right.edge_id),
+    (left, right) => compareUnicodeCodePoints(left.edge_id, right.edge_id),
   );

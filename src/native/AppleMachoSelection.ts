@@ -1,4 +1,37 @@
+import { LC } from "../domain/apple/machoLoadCommandCodes.js";
+import type {
+  FileMapping,
+  ZeroFillMapping,
+} from "../domain/virtualFileMapping.js";
+import {
+  machoDependencyCommand,
+  readMachoDylibCommandFacts,
+} from "../domain/apple/machoDylibCommand.js";
+import { readMachoSectionHeader } from "../domain/apple/machoSectionHeader.js";
+import {
+  admitMachoSegmentMapping,
+  readMachoSegmentHeader,
+} from "../domain/apple/machoSegmentHeader.js";
+import {
+  MachoLoadCommandCursor,
+  readMachoLoadCommandDeclarations,
+} from "../domain/apple/machoLoadCommands.js";
+import { createHash } from "node:crypto";
+import {
+  BinaryFormatFailure,
+  createFileMappingIndex,
+} from "./metadata/BinaryContainer.js";
+
 import type { FixupCommands } from "./AppleMachoFixups.js";
+import { decodeMachoFixedName, decodeMachoName } from "./AppleMachoNames.js";
+import { MACHO_ARCHITECTURE_POLICIES } from "./MachoArchitectureSelection.js";
+import {
+  readFatSliceDeclarations,
+  readFatHeaderPrefix,
+  validateFatSlice,
+  validateFatSliceIdentity,
+  type FatSliceDeclaration,
+} from "../domain/apple/machoContainer.js";
 
 /** One mapped Mach-O segment with file-backed VA range. */
 export interface Segment {
@@ -19,12 +52,23 @@ export interface Section {
 export interface MachoSlice {
   slice: number;
   sliceEnd: number;
+  /** FAT table identity, absent for a thin image. */
+  fatDeclaration?: FatSliceDeclaration & { readonly tableEnd: number };
 }
 
 /** Parsed little-endian 64-bit Mach-O layout for the selected architecture slice. */
 export interface MachoLayout {
   segments: Segment[];
   sections: Section[];
+  /** CPU identity and exact byte range selected from this source artifact. */
+  selectedImage: {
+    readonly container: "thin" | "fat";
+    readonly offset: number;
+    readonly byteLength: number;
+    readonly cpuType: number;
+    readonly cpuSubtype: number;
+    readonly containerTableSha256: string | null;
+  };
   /** Fixup load commands and dependent dylibs of the selected slice. */
   fixups: FixupCommands;
   /** VM address of the segment that maps file offset 0 (the preferred load address). */
@@ -35,133 +79,202 @@ export interface MachoLayout {
 
 const hex = (value: bigint) => `0x${value.toString(16)}`;
 
-/** Classify a FAT magic word; thin Mach-O returns null. */
-export const fatHeaderFormat = (
-  magic: number,
-): { readonly littleEndian: boolean; readonly fat64: boolean } | null => {
-  switch (magic) {
-    case 0xcafebabe:
-      return { littleEndian: false, fat64: false };
-    case 0xcafebabf:
-      return { littleEndian: false, fat64: true };
-    case 0xbebafeca:
-      return { littleEndian: true, fat64: false };
-    case 0xbfbafeca:
-      return { littleEndian: true, fat64: true };
-    default:
-      return null;
-  }
-};
+/** File range admission already chose. Metadata must not rank slices again. */
+export interface AdmittedMachoSlice {
+  readonly offset: number;
+  readonly size: number;
+}
 
-/** Select the thin Mach-O slice for `architecture` inside a FAT or thin container. */
+/**
+ * Locate the thin Mach-O image to read. A thin image is read whole; a
+ * universal image only at the slice target admission selected, whose
+ * declaration and CPU family this reader validates.
+ */
 export const selectMachoSlice = (
   bytes: Buffer,
   architecture: string,
+  admitted?: AdmittedMachoSlice,
 ): MachoSlice => {
-  const magic = bytes.readUInt32BE(0);
-  const header = fatHeaderFormat(magic);
-  if (header === null) return { slice: 0, sliceEnd: bytes.length };
-  const { littleEndian, fat64 } = header;
-  const stride = fat64 ? 32 : 20;
-  const readUInt32 = littleEndian
-    ? (offset: number) => bytes.readUInt32LE(offset)
-    : (offset: number) => bytes.readUInt32BE(offset);
-  const readUInt64 = littleEndian
-    ? (offset: number) => bytes.readBigUInt64LE(offset)
-    : (offset: number) => bytes.readBigUInt64BE(offset);
+  const header = readFatHeaderPrefix(bytes);
+  if (header.state === "unknown")
+    throw new RangeError("Truncated Mach-O header");
+  if (header.state === "not-fat") return { slice: 0, sliceEnd: bytes.length };
+  const { littleEndian, wide } = header;
   const byteOrder = littleEndian ? "little-endian" : "big-endian";
   const malformed = (reason: string) =>
     new RangeError(`${reason} (FAT header byte order: ${byteOrder})`);
   const invalid = (reason: string) =>
     new TypeError(`${reason} (FAT header byte order: ${byteOrder})`);
-  if (bytes.length < 8) throw malformed("Malformed FAT architecture table");
-  const count = readUInt32(4);
-  const headerEnd = 8 + count * stride;
+  if (header.state === "incomplete")
+    throw malformed("Malformed FAT architecture table");
+  const { count, tableEnd: headerEnd } = header;
   if (count > 128 || headerEnd > bytes.length)
     throw malformed("Malformed FAT architecture table");
-  const cpu = architecture === "arm64" ? 0x0100000c : 0x01000007;
-  let selected: MachoSlice | undefined;
-  for (let index = 0; index < count; index++) {
-    const offset = 8 + index * stride;
-    if (readUInt32(offset) !== cpu) continue;
-    if (selected !== undefined)
-      throw invalid("Ambiguous FAT architecture slice");
-    const start = fat64
-      ? readUInt64(offset + 8)
-      : BigInt(readUInt32(offset + 8));
-    const size = fat64
-      ? readUInt64(offset + 16)
-      : BigInt(readUInt32(offset + 12));
-    if (start < BigInt(headerEnd) || start + size > BigInt(bytes.length))
-      throw malformed("FAT slice exceeds file");
-    selected = { slice: Number(start), sliceEnd: Number(start + size) };
-  }
-  if (selected === undefined)
+  const policy = MACHO_ARCHITECTURE_POLICIES[architecture];
+  if (policy === undefined)
     throw invalid("Requested FAT architecture is absent");
-  return selected;
+  const declarations = readFatSliceDeclarations(bytes.subarray(8, headerEnd), {
+    count,
+    wide,
+    littleEndian,
+  });
+  if (declarations.status !== "parsed") throw malformed(declarations.reason);
+  // Target admission owns slice choice; ranking here again could read a
+  // different slice than the one the session's Evidence names.
+  if (admitted === undefined)
+    throw invalid("Universal Mach-O metadata needs the admitted slice");
+  const matches = declarations.slices.filter(
+    (declaration) =>
+      declaration.offset === admitted.offset &&
+      declaration.size === admitted.size,
+  );
+  const [match] = matches;
+  if (match === undefined) throw invalid("Admitted FAT slice is not declared");
+  if (matches.length > 1)
+    throw malformed("Admitted FAT slice is declared more than once");
+  if (match.cpuType !== policy.cpuType)
+    throw invalid(
+      "Admitted FAT slice does not match the requested architecture",
+    );
+  const issue = validateFatSlice(match, bytes.length, headerEnd);
+  if (issue !== null) throw malformed(issue);
+  return {
+    slice: match.offset,
+    sliceEnd: match.offset + match.size,
+    fatDeclaration: { ...match, tableEnd: headerEnd },
+  };
 };
+
+/** A recognized Mach-O class outside this metadata reader's supported formats. */
+export class UnsupportedMachoMetadataFormatError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsupportedMachoMetadataFormatError";
+  }
+}
 
 /** Parse segments/sections for a little-endian 64-bit Mach-O architecture slice. */
 export const parseMachoLayout = (
   bytes: Buffer,
   architecture: string,
+  admitted?: AdmittedMachoSlice,
 ): MachoLayout => {
   if (bytes.length < 4) throw new RangeError("Truncated Mach-O header");
-  const { slice, sliceEnd } = selectMachoSlice(bytes, architecture);
-  if (slice === 0 && sliceEnd === bytes.length && bytes.length < 32)
-    throw new RangeError("Truncated Mach-O header");
-  if (slice + 32 > sliceEnd || bytes.readUInt32LE(slice) !== 0xfeedfacf)
+  const selection = selectMachoSlice(bytes, architecture, admitted);
+  const { slice, sliceEnd } = selection;
+  if (slice + 4 > sliceEnd) throw new RangeError("Truncated Mach-O header");
+  const selectedBytes = bytes.subarray(slice, sliceEnd);
+  const declarations = readMachoLoadCommandDeclarations(
+    selectedBytes,
+    selectedBytes.length,
+  );
+  if (!declarations.ok) throw new RangeError("Truncated Mach-O header");
+  if (declarations.value === null) {
+    if (selectedBytes.length < 32)
+      throw new RangeError("Truncated Mach-O header");
     throw new TypeError(
       "Only little-endian 64-bit Mach-O metadata is supported",
     );
-  const commands = bytes.readUInt32LE(slice + 16);
-  const commandEnd = slice + 32 + bytes.readUInt32LE(slice + 20);
-  if (commands > 4096 || commandEnd > sliceEnd)
+  }
+  const table = declarations.value;
+  const { cpuType, cpuSubtype } = table.identity;
+  const fat = selection.fatDeclaration;
+  if (fat !== undefined) {
+    const issue = validateFatSliceIdentity(fat, {
+      cpuType,
+      cpuSubtype,
+    });
+    if (issue !== null) throw new TypeError(issue);
+  }
+  if (table.wide && !table.littleEndian) {
+    if (cpuType !== 0x01000012)
+      throw new BinaryFormatFailure(
+        "unsupported",
+        "Unsupported big-endian Mach-O CPU type",
+      );
+    throw new UnsupportedMachoMetadataFormatError(
+      "Unsupported big-endian 64-bit PowerPC Mach-O metadata",
+    );
+  }
+  // A thin image has no FAT declaration to bind the requested CPU family.
+  // Admit its parsed header before consumers attach the caller's architecture.
+  if (MACHO_ARCHITECTURE_POLICIES[architecture]?.cpuType !== cpuType)
+    throw new TypeError(
+      `Mach-O CPU type does not match requested architecture ${architecture}`,
+    );
+  if (!table.wide)
+    throw new UnsupportedMachoMetadataFormatError(
+      `Unsupported 32-bit Mach-O metadata for requested CPU type ${architecture}`,
+    );
+  const commandEnd = slice + table.headerSize + table.commandBytes;
+  if (commandEnd > sliceEnd)
     throw new RangeError("Malformed Mach-O command bounds");
   const state: LayoutState = {
     slice,
     sliceEnd,
     segments: [],
+    mappings: [],
+    zeroFills: [],
     sections: [],
     dylibs: [],
     binds: [],
+    rebases: [],
     chained: null,
     baseAddress: undefined,
   };
-  let cursor = slice + 32;
-  for (let index = 0; index < commands; index++) {
-    if (cursor + 8 > commandEnd) throw new RangeError("Truncated load command");
+  const framing = new MachoLoadCommandCursor(table);
+  while (framing.nextOffset !== null) {
+    const cursor = slice + table.headerSize + framing.nextOffset;
+    const frame = framing.read(bytes.subarray(cursor, cursor + 8));
+    if (!frame.ok) throw new RangeError(frame.error);
     const command = {
       cursor,
-      kind: bytes.readUInt32LE(cursor),
-      size: bytes.readUInt32LE(cursor + 4),
+      kind: frame.value.command,
+      size: frame.value.size,
     };
-    if (command.size < 8 || cursor + command.size > commandEnd)
-      throw new RangeError("Invalid load command size");
+    if (command.kind === 1)
+      throw new RangeError(
+        "Mach-O segment command does not match the header width",
+      );
     if (command.kind === 0x19) collectSegment(bytes, command, state);
     else collectFixupCommand(bytes, command, state);
-    cursor += command.size;
   }
-  const { segments, sections, chained, binds, dylibs } = state;
+  const complete = framing.finish();
+  if (!complete.ok) throw new RangeError(complete.error);
+  const { segments, sections, chained, binds, rebases, dylibs } = state;
+  const mappings = createFileMappingIndex(state.mappings, state.zeroFills);
   const offset = (address: bigint, size = 1): number => {
-    const matches = segments.filter(
-      (segment) =>
-        address >= segment.address &&
-        address + BigInt(size) <= segment.address + segment.size,
-    );
-    if (matches.length !== 1)
+    try {
+      return mappings.offset(address, size);
+    } catch (cause) {
+      // Metadata consumers use RangeError to retain partial facts when a
+      // pointer is unavailable. Mapping interpretation belongs to the shared
+      // image reader, including aliases that only overlap part of the span.
+      if (!(cause instanceof BinaryFormatFailure)) throw cause;
       throw new RangeError(
         `Unmapped or ambiguous metadata pointer ${hex(address)}`,
+        { cause },
       );
-    const segment = matches[0];
-    if (segment === undefined) throw new RangeError("Missing metadata segment");
-    return segment.offset + Number(address - segment.address);
+    }
   };
   return {
     segments,
     sections,
+    selectedImage: {
+      container: fat === undefined ? "thin" : "fat",
+      offset: slice,
+      byteLength: sliceEnd - slice,
+      cpuType,
+      cpuSubtype,
+      containerTableSha256:
+        fat === undefined
+          ? null
+          : createHash("sha256")
+              .update(bytes.subarray(0, fat.tableEnd))
+              .digest("hex"),
+    },
     offset,
-    fixups: { chained, binds, dylibs },
+    fixups: { chained, binds, rebases, dylibs },
     baseAddress: state.baseAddress ?? 0n,
   };
 };
@@ -171,9 +284,12 @@ interface LayoutState {
   readonly slice: number;
   readonly sliceEnd: number;
   readonly segments: Segment[];
+  readonly mappings: FileMapping[];
+  readonly zeroFills: ZeroFillMapping[];
   readonly sections: Section[];
-  readonly dylibs: string[];
+  readonly dylibs: FixupCommands["dylibs"][number][];
   readonly binds: FixupCommands["binds"][number][];
+  readonly rebases: FixupCommands["rebases"][number][];
   chained: FixupCommands["chained"];
   baseAddress: bigint | undefined;
 }
@@ -191,43 +307,71 @@ const collectSegment = (
   { cursor, size }: LoadCommand,
   state: LayoutState,
 ): void => {
-  if (size < 72) throw new RangeError("Truncated segment command");
-  const address = bytes.readBigUInt64LE(cursor + 24),
-    fileSize = bytes.readBigUInt64LE(cursor + 48),
-    fileOffset = bytes.readBigUInt64LE(cursor + 40);
+  const parsed = readMachoSegmentHeader(
+    bytes.subarray(cursor, cursor + size),
+    true,
+    true,
+  );
+  if (!parsed.ok) throw new RangeError("Truncated segment command");
+  const {
+    address,
+    memorySize,
+    nameBytes,
+    fileSize,
+    fileOffset,
+    protection,
+    sectionCount: count,
+    headerSize,
+  } = parsed.value;
+  const admitted = admitMachoSegmentMapping(parsed.value, 64);
+  if (!admitted.ok) throw new RangeError(admitted.error.message);
   if (fileOffset + fileSize > BigInt(state.sliceEnd - state.slice))
     throw new RangeError("Segment file range exceeds target bytes");
+  const name = decodeMachoFixedName(nameBytes);
   state.segments.push({
     address,
     size: fileSize,
     offset: state.slice + Number(fileOffset),
-    executable: (bytes.readUInt32LE(cursor + 60) & 4) !== 0,
+    executable: (protection & 4) !== 0,
   });
-  if (fileOffset === 0n && fileSize > 0n) state.baseAddress ??= address;
-  const count = bytes.readUInt32LE(cursor + 64);
-  if (72 + count * 80 > size) throw new RangeError("Truncated section table");
+  if (!admitted.value.unmapped && name !== "__PAGEZERO")
+    state.mappings.push({
+      address,
+      size: Number(fileSize),
+      offset: state.slice + Number(fileOffset),
+    });
+  if (memorySize > fileSize && name !== "__PAGEZERO")
+    state.zeroFills.push({
+      address: address + fileSize,
+      size: memorySize - fileSize,
+    });
+  if (
+    !admitted.value.unmapped &&
+    name !== "__PAGEZERO" &&
+    fileOffset === 0n &&
+    fileSize > 0n
+  )
+    state.baseAddress ??= address;
+  if (headerSize + count * 80 > size)
+    throw new RangeError("Truncated section table");
   for (let section = 0; section < count; section++) {
-    const position = cursor + 72 + section * 80;
-    const sectionSize = bytes.readBigUInt64LE(position + 40);
+    const position = cursor + headerSize + section * 80;
+    const parsedSection = readMachoSectionHeader(
+      bytes.subarray(position, position + 80),
+      true,
+      true,
+    );
+    if (!parsedSection.ok) throw new RangeError("Truncated section table");
+    const { nameBytes, address, size: sectionSize } = parsedSection.value;
     if (sectionSize > BigInt(Number.MAX_SAFE_INTEGER))
       throw new RangeError("Section size exceeds exact numeric range");
     state.sections.push({
-      name: bytes
-        .subarray(position, position + 16)
-        .toString("ascii")
-        .replace(/\0.*$/u, ""),
-      address: bytes.readBigUInt64LE(position + 32),
+      name: decodeMachoFixedName(nameBytes),
+      address,
       size: Number(sectionSize),
     });
   }
 };
-
-const LC_DYLD_INFO = 0x22;
-const LC_DYLD_INFO_ONLY = 0x80000022;
-const LC_DYLD_CHAINED_FIXUPS = 0x80000034;
-const DYLIB_COMMANDS: readonly number[] = [
-  0xc, 0x80000018, 0x8000001f, 0x20, 0x80000023,
-];
 
 /** Record fixup data ranges and dylib install names from one load command. */
 const collectFixupCommand = (
@@ -242,9 +386,13 @@ const collectFixupCommand = (
       throw new RangeError("Fixup data exceeds the Mach-O slice");
     return { offset, size: length };
   };
-  if (kind === LC_DYLD_CHAINED_FIXUPS && size >= 16)
+  if (kind === LC.DYLD_CHAINED_FIXUPS) {
+    if (size < 16) throw new RangeError("Truncated chained-fixups command");
     state.chained = range(cursor + 8);
-  else if ((kind === LC_DYLD_INFO || kind === LC_DYLD_INFO_ONLY) && size >= 48)
+  } else if (kind === LC.DYLD_INFO || kind === LC.DYLD_INFO_ONLY) {
+    if (size < 48) throw new RangeError("Truncated dyld-info command");
+    const rebase = range(cursor + 8);
+    if (rebase.size > 0) state.rebases.push(rebase);
     for (const [at, stream] of [
       [cursor + 16, "bind"],
       [cursor + 24, "weak"],
@@ -253,13 +401,27 @@ const collectFixupCommand = (
       const bound = range(at);
       if (bound.size > 0) state.binds.push({ ...bound, stream });
     }
-  else if (DYLIB_COMMANDS.includes(kind) && size >= 24) {
-    const nameOffset = bytes.readUInt32LE(cursor + 8);
-    const end = bytes.indexOf(0, cursor + nameOffset);
+  } else if (machoDependencyCommand(kind) !== null) {
+    const parsed = readMachoDylibCommandFacts(
+      bytes.subarray(cursor, cursor + size),
+      true,
+    );
+    if (!parsed.ok) {
+      if (parsed.error._tag === "InvalidMachoDylibCommand")
+        throw new RangeError("Truncated dylib command");
+      if (parsed.error.reason === "unterminated")
+        throw new RangeError("Unterminated dylib install name");
+      throw new RangeError("Dylib install name is outside its load command");
+    }
+    const { nameBytes } = parsed.value;
     state.dylibs.push(
-      nameOffset >= size || end < 0 || end > cursor + size
-        ? ""
-        : bytes.toString("utf8", cursor + nameOffset, end),
+      decodeMachoName(
+        Buffer.from(
+          nameBytes.buffer,
+          nameBytes.byteOffset,
+          nameBytes.byteLength,
+        ),
+      ),
     );
   }
 };

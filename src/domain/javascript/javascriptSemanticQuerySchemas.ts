@@ -5,23 +5,22 @@ import {
   JAVASCRIPT_SEMANTIC_RELATIONS,
   javaScriptSemanticNodeSchema,
   javaScriptSemanticRelationSchema,
+  javaScriptSemanticEvidenceContextSchema,
   javaScriptSemanticUnknownSchema,
 } from "./javascriptSemanticGraphSchemas.js";
-import { jsonValueSchema } from "../jsonValue.js";
-import { digestSchema } from "../digests.js";
-import { prefixedDigestSchema } from "../digests.js";
+import { digestSchema, prefixedDigestSchema } from "../digests.js";
 
 const semanticNodeIdSchema = prefixedDigestSchema("jsrg_node");
+const literalValueSchema = z.union([
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.null(),
+]);
+
 const literalSeedSchema = z.strictObject({
   kind: z.literal("literal"),
-  value: jsonValueSchema.refine(
-    (value) =>
-      value === null ||
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean",
-    "Literal seeds accept only JSON primitive values",
-  ),
+  value: literalValueSchema,
 });
 
 /** Authenticated starting points accepted by semantic tracing. */
@@ -41,15 +40,17 @@ export const javaScriptSemanticQuerySeedSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("property"),
-    name: z.string().min(1),
+    name: z.string(),
   }),
+  // Analysis preserves the complete literal endpoint, including the empty
+  // string, so the seed matches any retained value exactly, as event does.
   z.strictObject({
     kind: z.literal("endpoint"),
-    value: z.string().min(1),
+    value: z.string(),
   }),
   z.strictObject({
     kind: z.literal("event"),
-    name: z.string().min(1),
+    name: z.string(),
   }),
   z.strictObject({
     kind: z.literal("boundary-field"),
@@ -88,17 +89,18 @@ export const javaScriptSemanticQueryResultSchema = z.strictObject({
   direction: javaScriptSemanticQueryInputSchema.shape.direction,
   status: z.enum(["found", "no-match", "ambiguous", "partial", "unsupported"]),
   seed_node_ids: z.array(semanticNodeIdSchema),
+  evidence_contexts: z.array(javaScriptSemanticEvidenceContextSchema),
   nodes: z.array(javaScriptSemanticNodeSchema),
   relations: z.array(javaScriptSemanticRelationSchema),
   unknowns: z.array(javaScriptSemanticUnknownSchema),
   expected_match_node_ids: z.array(semanticNodeIdSchema),
   summary: z.strictObject({
-    total_seed_matches: z.number().int().min(0),
-    traversed_nodes: z.number().int().min(0),
-    traversed_relations: z.number().int().min(0),
-    traversed_functions: z.number().int().min(0),
-    traversed_modules: z.number().int().min(0),
-    relevant_unknowns: z.number().int().min(0),
+    total_seed_matches: z.int().min(0),
+    traversed_nodes: z.int().min(0),
+    traversed_relations: z.int().min(0),
+    traversed_functions: z.int().min(0),
+    traversed_modules: z.int().min(0),
+    relevant_unknowns: z.int().min(0),
   }),
   coverage: z.strictObject({
     status: z.enum(["complete", "partial", "unavailable"]),

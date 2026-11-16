@@ -1,8 +1,7 @@
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
-import {
-  canonicalExportShapeValue,
-  digestExportShapeValue,
-} from "./javascriptExportShapeComparisonIdentity.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import { canonicalJson } from "../comparisonSemantics.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
 import {
   javaScriptExportShapeComparisonResultSchema,
   type JavaScriptExportShapeComparisonChange,
@@ -17,6 +16,7 @@ import {
 } from "./javascriptExportShapeSelection.js";
 import {
   buildJavaScriptExportShapeChanges,
+  buildJavaScriptExportShapeInventories,
   hasPartialJavaScriptExportPropertyCoverage,
   pairJavaScriptExportShapeVariants,
   type JavaScriptExportShapePairing,
@@ -56,6 +56,11 @@ export const compareJavaScriptExportShapes = (
   );
   const changes = allChanges;
   const omittedChanges = 0;
+  const propertyInventories = buildJavaScriptExportShapeInventories({
+    pairing,
+    leftShapes: leftRetained.shapes,
+    rightShapes: rightRetained.shapes,
+  });
   const coverage = comparisonCoverage({
     input,
     left,
@@ -70,6 +75,7 @@ export const compareJavaScriptExportShapes = (
   const semantic = {
     left: left.selection,
     right: right.selection,
+    property_inventories: propertyInventories,
     summary: summarize(allChanges),
     changes,
     coverage,
@@ -78,7 +84,7 @@ export const compareJavaScriptExportShapes = (
   };
   return javaScriptExportShapeComparisonResultSchema.parse({
     ...semantic,
-    comparison_id: `jesc_${digestExportShapeValue(semantic)}`,
+    comparison_id: `jesc_${digestCanonicalValue(semantic, "JavaScript export shape comparison")}`,
   });
 };
 
@@ -89,18 +95,21 @@ const sortChanges = (
     .map((change, index) => ({
       change,
       index,
-      sortKey: canonicalExportShapeValue({
-        discriminant: change.discriminant,
-        path: change.path,
-        status: change.status,
-        left_source_range: change.left_source_range,
-        right_source_range: change.right_source_range,
-        change_id: change.change_id,
-      }),
+      sortKey: canonicalJson(
+        {
+          discriminant: change.discriminant,
+          path: change.path,
+          status: change.status,
+          left_source_range: change.left_source_range,
+          right_source_range: change.right_source_range,
+          change_id: change.change_id,
+        },
+        "JavaScript export shape comparison",
+      ),
     }))
     .sort(
       (left, right) =>
-        compareCodePoints(left.sortKey, right.sortKey) ||
+        compareUnicodeCodePoints(left.sortKey, right.sortKey) ||
         left.index - right.index,
     )
     .map(({ change }) => change);

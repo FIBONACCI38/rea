@@ -2,25 +2,26 @@ import {
   createEvidence,
   type Evidence,
   type EvidenceObservation,
+  type EvidenceSubjectTarget,
 } from "../../domain/evidence.js";
 import type { ApplicationVersionComparisonResult } from "../../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
 import type { JavaScriptExportShapeComparisonResult } from "../../domain/javascript/javascriptExportShapeComparisonSchemas.js";
 import type { ApplicationFeatureTraceResult } from "../../domain/javascript/javascriptFeatureTraceSchemas.js";
 import type { JavaScriptSemanticTraceResult } from "../../domain/javascript/javascriptSemanticTraceSchemas.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
 import type { SourceToBundleComparisonResult } from "../../domain/javascript/sourceToBundleComparisonSchemas.js";
-import { JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER } from "../InvestigationProviders.js";
+import { JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER } from "../../domain/investigationProviders.js";
 
 /** Create derived Evidence for one bounded application-graph feature trace. */
 export const createApplicationFeatureTraceEvidence = (
+  subject: EvidenceSubjectTarget | undefined,
   parameters: EvidenceObservation["parameters"],
   result: ApplicationFeatureTraceResult,
 ): Evidence =>
-  createEvidence(undefined, JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER, {
+  createEvidence(subject, JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER, {
     predicateType: "rea.application-feature-trace",
     operation: "trace_application_feature",
     parameters,
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",
@@ -31,14 +32,15 @@ export const createApplicationFeatureTraceEvidence = (
 
 /** Create derived Evidence for one bounded JavaScript semantic trace. */
 export const createJavaScriptSemanticTraceEvidence = (
+  subject: EvidenceSubjectTarget | undefined,
   parameters: EvidenceObservation["parameters"],
   result: JavaScriptSemanticTraceResult,
 ): Evidence =>
-  createEvidence(undefined, JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER, {
+  createEvidence(subject, JAVASCRIPT_APPLICATION_WORKFLOW_PROVIDER, {
     predicateType: "rea.javascript-semantic-trace",
     operation: "trace_javascript_semantics",
     parameters,
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",
@@ -56,7 +58,7 @@ export const createApplicationVersionComparisonEvidence = (
     predicateType: "rea.application-version-comparison",
     operation: "compare_application_versions",
     parameters,
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",
@@ -74,7 +76,7 @@ export const createSourceToBundleComparisonEvidence = (
     predicateType: "rea.source-to-bundle-comparison",
     operation: "compare_source_to_bundle",
     parameters,
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",
@@ -92,7 +94,7 @@ export const createJavaScriptExportShapeComparisonEvidence = (
     predicateType: "rea.javascript-export-shape-comparison",
     operation: "compare_javascript_export_shapes",
     parameters,
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",

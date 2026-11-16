@@ -1,5 +1,10 @@
 #!/usr/bin/env node
+import { withVerifierCleanup } from "./lib/verifier-cleanup.mjs";
 import assert from "node:assert/strict";
+import {
+  requireMcpOperationResult,
+  requireMcpOutput,
+} from "./lib/mcp-verifier-results.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -67,13 +72,14 @@ for (const [role, command] of Object.entries(commands)) {
 }
 let installation;
 if (!compilerOnly) {
-  const { inspectGhidraInstallation } =
-    await import("../dist/ghidra/GhidraInstallation.js");
+  const { inspectVerifierGhidraInstallation } =
+    await import("./lib/ghidra-installation-inspection.mjs");
   assert.ok(
     process.env.GHIDRA_INSTALL_DIR,
     "Ghidra switch lane prerequisite missing: GHIDRA_INSTALL_DIR (bring your own)",
   );
-  installation = inspectGhidraInstallation({
+  installation = await inspectVerifierGhidraInstallation({
+    environment: process.env,
     installDir: process.env.GHIDRA_INSTALL_DIR,
     ...(process.env.JAVA_HOME === undefined
       ? {}
@@ -90,7 +96,7 @@ await writeFile(source, buildSwitchSource());
 const flags = ["-O2", "-g", "-fno-pie", "-no-pie"];
 const results = [];
 let productionControls = null;
-try {
+await withVerifierCleanup(async () => {
   for (const compiler of ["gcc", "clang"]) {
     const original = join(workspace, `${compiler}-optimized`);
     await exec(commands[compiler], [...flags, source, "-o", original]);
@@ -164,17 +170,19 @@ try {
       });
     }
   }
-} finally {
-  try {
+}, [
+  async () => {
     assert.deepEqual(
       (await readdir(runtime)).filter((name) => name.startsWith("rea-ghidra-")),
       [],
       "Owned Ghidra runtime survived close",
     );
-  } finally {
+    const cleanup = await completeVerifierRun(run);
+    assert.equal(cleanup.process_lineage.status, "verified");
+    assert.deepEqual(cleanup.process_lineage.descendants, []);
     await rm(workspace, { recursive: true, force: true });
-  }
-}
+  },
+]);
 const lifecycle = await completeVerifierRun(run);
 if (lifecycle.process_lineage.status === "verified")
   assert.deepEqual(lifecycle.process_lineage.descendants, []);
@@ -207,14 +215,14 @@ async function verifyTarget(path, sha256, fixtures, variant) {
   let opened = false;
   let stderr = "";
   const observations = [];
-  try {
+  return withVerifierCleanup(async () => {
     await client.connect(transport);
     transport.stderr?.on("data", (chunk) => {
       stderr = (stderr + chunk.toString()).slice(-65536);
     });
     const target = await call(client, "open_binary", {
       path,
-      provider: "ghidra",
+      provider_id: "ghidra",
     });
     opened = true;
     assert.equal(target.sha256, sha256);
@@ -237,15 +245,21 @@ async function verifyTarget(path, sha256, fixtures, variant) {
       const observed = await toolResult(client, "inspect_native_api", {
         procedure: procedure.address,
       });
-      assertWorkflowIdentity(observed.evidence, sha256);
-      assert.equal(observed.result.procedure.address, procedure.address);
+      assertWorkflowIdentity(observed, sha256);
+      assert.equal(
+        observed.normalized_result.procedure.address,
+        procedure.address,
+      );
       const summary = assertSwitchBoundary(
-        observed.result.boundary,
+        observed.normalized_result.boundary,
         observationFixture,
       );
       assert.deepEqual(
-        [...observed.result.residual_unknowns].sort(),
-        expectedResidualUnknowns(observed.result.boundary, fixture).sort(),
+        [...observed.normalized_result.residual_unknowns].sort(),
+        expectedResidualUnknowns(
+          observed.normalized_result.boundary,
+          fixture,
+        ).sort(),
         "Residual unknowns must preserve unresolved ABI types and exactly the expected switch uncertainty",
       );
       const cli = await cliSwitchEvidence(
@@ -259,34 +273,30 @@ async function verifyTarget(path, sha256, fixtures, variant) {
       assertSwitchBoundary(cli.normalized_result.boundary, observationFixture);
       assert.deepEqual(
         cli.normalized_result.boundary.jump_tables,
-        observed.result.boundary.jump_tables,
+        observed.normalized_result.boundary.jump_tables,
         "CLI/MCP switch mappings/defaults/data-source evidence differ",
       );
       assert.deepEqual(
         cli.normalized_result.residual_unknowns,
-        observed.result.residual_unknowns,
+        observed.normalized_result.residual_unknowns,
       );
       observations.push({
         name: fixture.name,
         ...summary,
         cli_mcp_equal: true,
-        limitations: observed.result.boundary.limitations,
-        residual_unknowns: observed.result.residual_unknowns,
-        jump_tables: observed.result.boundary.jump_tables,
+        limitations: observed.normalized_result.boundary.limitations,
+        residual_unknowns: observed.normalized_result.residual_unknowns,
+        jump_tables: observed.normalized_result.boundary.jump_tables,
       });
     }
     return { observations, stderr };
-  } finally {
-    try {
+  }, [
+    async () => {
       if (opened) await call(client, "close_binary");
-    } finally {
-      try {
-        await client.close();
-      } finally {
-        await transport.close();
-      }
-    }
-  }
+    },
+    () => client.close(),
+    () => transport.close(),
+  ]);
 }
 function assertWorkflowIdentity(evidence, sha256) {
   assert.equal(evidence.subject.digest.sha256, sha256);
@@ -318,15 +328,15 @@ async function toolResult(client, name, arguments_ = {}) {
     { name, arguments: arguments_ },
     { timeout: 240000 },
   );
-  assert.notEqual(result.isError, true, JSON.stringify(result));
-  assert.ok(
-    result.structuredContent && "result" in result.structuredContent,
-    `${name} omitted structured result`,
-  );
-  return result.structuredContent;
+  assert.ok(result.structuredContent, `${name} omitted structured result`);
+  return requireMcpOutput(result, name);
 }
 async function call(client, name, arguments_ = {}) {
-  return (await toolResult(client, name, arguments_)).result;
+  const result = await client.callTool(
+    { name, arguments: arguments_ },
+    { timeout: 240000 },
+  );
+  return requireMcpOperationResult(result, name);
 }
 
 async function cliSwitchEvidence(entrypoint, path, procedure, env) {

@@ -5,13 +5,27 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
+import { xcodeIbtoolAvailable } from "../../fixtures/ibtool.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { decodeNibArchive } from "../../../src/artifacts/apple/NibArchive.js";
 import { analyzeInterfaceBuilderBundle } from "../../../src/artifacts/apple/InterfaceBuilderAnalysis.js";
 
+import { interfaceBuilderAnalysisSchema } from "../../../src/domain/apple/interfaceBuilderGraph.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
+import {
+  createInterfaceBuilderUidFixture,
+  expectInterfaceBuilderUidCase,
+  interfaceBuilderUidCases,
+} from "../../fixtures/interfaceBuilderMalformedUid.js";
+import { cliTest } from "../../support/cli/cliFixture.js";
+
 const compile = promisify(execFile);
 
-const compileNestedViews = async (depth: number, withWindow = false) => {
+const compileNestedViews = async (
+  depth: number,
+  withWindow = false,
+  withTextField = false,
+) => {
   const root = await createTestTempDirectory("rea-nib-hierarchy-");
   const bundle = join(root, "Fixture.app");
   const resources = join(bundle, "Contents", "Resources");
@@ -28,6 +42,11 @@ const compileNestedViews = async (depth: number, withWindow = false) => {
     ).join("") + "</subviews></view>".repeat(depth);
   const xib = join(root, "Nested.xib");
   let xibSource = source.replace("</subviews>", `${nested}</subviews>`);
+  if (withTextField)
+    xibSource = xibSource.replace(
+      "</subviews>",
+      `<textField id="text"><rect key="frame" x="20" y="60" width="120" height="22"/><textFieldCell key="cell" title="Sample" id="text-cell"><font key="font" metaFont="system"/></textFieldCell></textField></subviews>`,
+    );
   if (withWindow)
     xibSource = xibSource
       .replace(
@@ -48,7 +67,7 @@ const compileNestedViews = async (depth: number, withWindow = false) => {
   return { bundle, archive: decodeNibArchive(await readFile(nib)) };
 };
 
-describe.skipIf(process.platform !== "darwin")(
+describe.skipIf(!xcodeIbtoolAvailable)(
   "native compiled NIB view hierarchy",
   () => {
     it.each([4, 40])(
@@ -134,6 +153,31 @@ describe.skipIf(process.platform !== "darwin")(
       expect(result.graph.truncated).toBe(false);
     });
 
+    it("does not treat a compiled text field cell as an unplaced view", async () => {
+      const { bundle, archive } = await compileNestedViews(0, true, true);
+      const text = archive.objects.find(
+        ({ class_name }) => class_name === "NSTextField",
+      );
+      const cell = archive.objects.find(
+        ({ class_name }) => class_name === "NSTextFieldCell",
+      );
+      expect(text).toBeDefined();
+      expect(cell).toBeDefined();
+      expect(cell?.values.NSControlView).toEqual({ $nib_object_ref: text?.id });
+      const result = await analyzeInterfaceBuilderBundle({
+        bundlePath: bundle,
+        targetSha256: "e".repeat(64),
+      });
+      expect(result.documents[0]?.hierarchy_complete).toBe(true);
+      expect(result.graph.truncated).toBe(false);
+      expect(result.graph.coverage).toContainEqual(
+        expect.objectContaining({
+          facet: "hierarchy:Contents/Resources/Main.nib",
+          status: "complete",
+        }),
+      );
+    });
+
     it("reports partial coverage for a native hierarchy beyond the projection depth bound", async () => {
       const { bundle } = await compileNestedViews(132);
       const result = await analyzeInterfaceBuilderBundle({
@@ -173,6 +217,52 @@ describe.skipIf(process.platform !== "darwin")(
             facet: "hierarchy:Contents/Resources/Main.nib",
             status: "partial",
           }),
+        );
+      },
+    );
+  },
+);
+
+// Selected by the existing native Apple CI job; no workflow change is needed.
+describe.skipIf(process.platform !== "darwin")(
+  "Foundation malformed hierarchy references",
+  () => {
+    it.each(interfaceBuilderUidCases)(
+      "filesystem reports %s hierarchy coverage and original bytes",
+      async (selectedCase) => {
+        const fixture = await createInterfaceBuilderUidFixture(selectedCase);
+        const result = await analyzeInterfaceBuilderBundle({
+          bundlePath: fixture.app,
+          targetSha256: "f".repeat(64),
+        });
+        expectInterfaceBuilderUidCase(
+          result,
+          selectedCase,
+          fixture.bytes,
+          fixture.oracle,
+        );
+      },
+    );
+    cliTest.for(interfaceBuilderUidCases)(
+      "built CLI reports $0 hierarchy coverage and original bytes",
+      async (selectedCase, { cli }) => {
+        const fixture = await createInterfaceBuilderUidFixture(selectedCase);
+        const output = await cli.run({
+          arguments: ["decode-interface-builder", fixture.app, "--json"],
+          environment: {
+            REA_LOG_LEVEL: "silent",
+            REA_ANALYSIS_PROVIDER: "auto",
+          },
+        });
+        expect(output.exitCode, JSON.stringify(output)).toBe(0);
+        const result = interfaceBuilderAnalysisSchema.parse(
+          parseEvidence(output.json).normalized_result,
+        );
+        expectInterfaceBuilderUidCase(
+          result,
+          selectedCase,
+          fixture.bytes,
+          fixture.oracle,
         );
       },
     );

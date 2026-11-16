@@ -7,12 +7,12 @@ import {
   analyzeParsedJavaScriptSemantics,
 } from "./javascriptSemanticAnalysis.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
-import { analyzeParsedJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeParsedJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
 import {
   collectJavaScriptExports,
   fingerprintJavaScriptAst,
 } from "./javascriptAstFingerprint.js";
-import type { JavaScriptSemanticValue } from "./javascriptSemanticIr.js";
+import type { JavaScriptSemanticValue } from "./javascriptSemanticValueTypes.js";
 import {
   onlyCallable,
   topLevelBinding,
@@ -44,7 +44,11 @@ describe("JavaScript semantic analysis: rejection 1", () => {
       expect(collectJavaScriptExports(parsed).values).toEqual([]);
       expect(fingerprintJavaScriptAst(parsed)).toMatch(/^[a-f0-9]{64}$/u);
       const ir = analyzeParsedJavaScriptSemantics(parsed);
-      expect(ir.coverage.status).toBe("complete");
+      expect(ir.coverage).toMatchObject({
+        status: "partial",
+        omittedCount: null,
+      });
+      expect(ir.expressionFlowsTruncated).toBe(true);
       const binding = topLevelBinding(ir, "result");
       expect(binding.value).toEqual({ status: "literal", value: 12000 });
       expect(ir.references).toEqual([
@@ -144,7 +148,11 @@ describe("JavaScript semantic analysis: rejection 1", () => {
     expect(recovered.returnSites[0]?.value).toMatchObject({
       status: "object",
       properties: expect.arrayContaining([
-        { name: "type", value: { status: "literal", value: "item" } },
+        {
+          name: "type",
+          presence: "present",
+          value: { status: "literal", value: "item" },
+        },
         expect.objectContaining({
           name: "text",
           value: expect.objectContaining({ status: "unknown" }),

@@ -38,15 +38,27 @@ describe("captured script path projection", () => {
     const paths = planned.map(({ record }) =>
       record.content.state === "exported" ? record.content.relative_path : "",
     );
-    expect(paths[0]).toMatch(/^origins\/[a-f0-9]{64}\/app\/main.js$/u);
+    expect(paths[0]).toMatch(/^origins\/[a-f0-9]{64}\/app\/main\.js$/u);
     expect(paths[1]?.replace("lib/value.mjs", "main.js")).toBe(paths[0]);
     expect(paths[2]).not.toBe(paths[0]);
   });
 
+  it.each(["+", "!", "$", "&", "'", "(", ")", ",", ";", "=", "@"])(
+    "preserves the portable literal URL path character %s",
+    (character) => {
+      const url = `https://a.test/app/chunk${character}name.js`;
+      const [planned] = planWebScriptExport([source(url)]);
+      expect(planned?.record.content).toMatchObject({
+        state: "exported",
+        layout: "url-path",
+        relative_path: expect.stringContaining(`/app/chunk${character}name.js`),
+      });
+    },
+  );
+
   it.each([
     ["https://a.test/main.js", "https://a.test/main.js"],
     ["https://a.test/main.js", "https://a.test/main.js?v=2"],
-    ["https://a.test/A/main.js", "https://a.test/a/other.js"],
     ["https://a.test/main.js", "https://a.test/main.js/child.js"],
   ])(
     "isolates every version in a conflicting layout (%s, %s)",
@@ -74,9 +86,14 @@ describe("captured script path projection", () => {
   it.each([
     "",
     "https://a.test/main.js?v=2",
+    "https://a.test/main.js?",
+    "https://a.test/main.js#",
+    "https://a.test/main.js?#",
     "https://a.test/main.js#variant",
     "data:text/javascript,export{}",
     "https://a.test/%2fescape.js",
+    "https://a.test/app/chunk:part.js",
+    "https://a.test/app/chunk*part.js",
     "https://a.test/CON.js",
     "https://a.test/目录/main.js",
     "https://a.test/app",
@@ -98,6 +115,25 @@ describe("captured script path projection", () => {
       });
     },
   );
+
+  it("keeps case-distinct URL paths until the destination collides", () => {
+    const planned = planWebScriptExport([
+      source("https://a.test/A/main.js"),
+      source("https://a.test/a/other.js", 2),
+    ]);
+    expect(
+      planned.every(
+        ({ record }) =>
+          record.content.state === "exported" &&
+          record.content.layout === "url-path",
+      ),
+    ).toBe(true);
+    const paths = planned.map(({ record }) =>
+      record.content.state === "exported" ? record.content.relative_path : "",
+    );
+    expect(paths[0]).toMatch(/\/A\/main\.js$/u);
+    expect(paths[1]).toMatch(/\/a\/other\.js$/u);
+  });
 
   it("does not choose a canonical version when a competing source is unavailable", () => {
     const missing: CapturedWebScript = {

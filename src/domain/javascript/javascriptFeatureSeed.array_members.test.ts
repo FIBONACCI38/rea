@@ -3,16 +3,19 @@ import { describe, expect, it } from "vitest";
 import {
   createJavaScriptApplicationGraph,
   createJavaScriptApplicationNode,
-  type ApplicationNode,
 } from "./javascriptApplicationGraph.js";
+import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
 import {
   artifactEvidence,
   completeCoverage,
 } from "./javascriptApplicationGraph.fixture.js";
 import { findApplicationFeatureSeeds } from "./javascriptFeatureSeed.js";
 import { traceApplicationFeature } from "./javascriptFeatureTrace.js";
-import type { ApplicationFeatureSeed } from "./javascriptFeatureTraceSchemas.js";
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import {
+  applicationFeatureSeedSchema,
+  type ApplicationFeatureSeed,
+} from "./javascriptFeatureTraceSchemas.js";
+import { analyzeCommonJsStaticFixture } from "../../../tests/fixtures/javascriptCommonJsAnalysis.js";
 import type { JsonValue } from "../jsonValue.js";
 
 const memberFields = [
@@ -40,100 +43,115 @@ const matchingModes = [
 describe.each(memberFields)(
   "$kind seeds for $nodeKind / $field",
   ({ kind, nodeKind, field }) => {
-    it.each(matchingModes)(
-      "matches scalar and array values with $match / $value / case-sensitive $case_sensitive",
-      (mode) => {
-        const values: readonly [JsonValue, string][] = [
-          ["openProject", ""],
-          [["closeProject", "openProject"], "[1]"],
-        ];
-        for (const [value, suffix] of values) {
-          const node = memberNode(nodeKind, { [field]: value });
-          expect(
-            findApplicationFeatureSeeds([node], { kind, ...mode }),
-          ).toEqual([propertyMatch(node, `${field}${suffix}`)]);
-        }
-      },
-    );
-
-    it("keeps exact, case-sensitive, and non-string exclusions", () => {
-      const node = memberNode(nodeKind, {
-        [field]: [null, 42, true, "openProject"],
-      });
-      for (const value of ["Project", "OPENPROJECT", "42", "true", "null"])
-        expect(findApplicationFeatureSeeds([node], seed(kind, value))).toEqual(
-          [],
-        );
-      expect(
-        findApplicationFeatureSeeds([node], {
-          ...seed(kind, "Project"),
-          match: null,
-        }),
-      ).toEqual([]);
-    });
-
-    it("retains actual indexes through nested arrays and object properties", () => {
-      const properties = {
-        nested: [{ [field]: [null, 42, false, [["openProject"]]] }],
-      };
-      const node = memberNode(nodeKind, properties);
-      const before = structuredClone(node);
-
-      expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([
-        propertyMatch(node, `nested[0].${field}[3][0][0]`),
-      ]);
-      expect(node).toEqual(before);
-      expect(properties.nested[0]?.[field]).toEqual([
-        null,
-        42,
-        false,
-        [["openProject"]],
-      ]);
-    });
-
-    it("preserves literal dotted-field suffixes for scalars and arrays", () => {
+    it("retains scalar and array member locations", () => {
       const values: readonly [JsonValue, string][] = [
         ["openProject", ""],
-        [["openProject"], "[0]"],
+        [["closeProject", "openProject"], "[1]"],
       ];
       for (const [value, suffix] of values) {
-        const node = memberNode(nodeKind, { [`nested.${field}`]: value });
+        const node = memberNode(nodeKind, { [field]: value });
         expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([
-          propertyMatch(node, `nested.${field}${suffix}`),
-        ]);
-      }
-    });
-
-    it("does not select near-fields, literal bracket keys, or object descendants", () => {
-      const cases = [
-        {
-          properties: { [`other_${field}`]: "openProject" },
-          path: `other_${field}`,
-        },
-        { properties: { [`${field}[0]`]: "openProject" }, path: `${field}[0]` },
-        {
-          properties: { [`nested.${field}[0]`]: ["openProject"] },
-          path: `nested.${field}[0][0]`,
-        },
-        {
-          properties: { [field]: { name: "openProject" } },
-          path: `${field}.name`,
-        },
-        {
-          properties: { [field]: [{ name: "openProject" }] },
-          path: `${field}[0].name`,
-        },
-      ];
-      for (const { properties, path } of cases) {
-        const node = memberNode(nodeKind, properties);
-        expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([]);
-        expect(findApplicationFeatureSeeds([node], seed("string"))).toEqual([
-          propertyMatch(node, path),
+          propertyMatch(node, `${field}${suffix}`),
         ]);
       }
     });
   },
 );
+
+describe("shared array-member matching semantics", () => {
+  const kind = "api";
+  const nodeKind = "context-bridge-api";
+  const field = "members";
+
+  it.each(matchingModes)(
+    "matches $match / $value / case-sensitive $case_sensitive",
+    (mode) => {
+      const node = memberNode(nodeKind, {
+        members: ["closeProject", "openProject"],
+      });
+      expect(findApplicationFeatureSeeds([node], { kind, ...mode })).toEqual([
+        propertyMatch(node, "members[1]"),
+      ]);
+    },
+  );
+
+  it("keeps exact, case-sensitive, and non-string exclusions", () => {
+    const node = memberNode(nodeKind, {
+      [field]: [null, 42, true, "openProject"],
+    });
+    for (const value of ["Project", "OPENPROJECT", "42", "true", "null"])
+      expect(findApplicationFeatureSeeds([node], seed(kind, value))).toEqual(
+        [],
+      );
+    expect(
+      findApplicationFeatureSeeds([node], {
+        ...seed(kind, "Project"),
+        match: null,
+      }),
+    ).toEqual([]);
+  });
+
+  it("retains actual indexes through nested arrays and object properties", () => {
+    const properties = {
+      nested: [{ [field]: [null, 42, false, [["openProject"]]] }],
+    };
+    const node = memberNode(nodeKind, properties);
+    const before = structuredClone(node);
+
+    expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([
+      propertyMatch(node, `nested[0].${field}[3][0][0]`),
+    ]);
+    expect(node).toEqual(before);
+    expect(properties.nested[0]?.[field]).toEqual([
+      null,
+      42,
+      false,
+      [["openProject"]],
+    ]);
+  });
+
+  it("preserves literal dotted-field suffixes for scalars and arrays", () => {
+    const values: readonly [JsonValue, string][] = [
+      ["openProject", ""],
+      [["openProject"], "[0]"],
+    ];
+    for (const [value, suffix] of values) {
+      const node = memberNode(nodeKind, { [`nested.${field}`]: value });
+      expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([
+        propertyMatch(node, `nested.${field}${suffix}`),
+      ]);
+    }
+  });
+
+  it("does not select near-fields, literal bracket keys, or object descendants", () => {
+    const cases = [
+      {
+        properties: { [`other_${field}`]: "openProject" },
+        path: `other_${field}`,
+      },
+      { properties: { [`${field}[0]`]: "openProject" }, path: `${field}[0]` },
+      {
+        properties: { [`nested.${field}[0]`]: ["openProject"] },
+        path: `nested.${field}[0][0]`,
+      },
+      {
+        properties: { [field]: { name: "openProject" } },
+        path: `${field}.name`,
+      },
+      {
+        properties: { [field]: [{ name: "openProject" }] },
+        path: `${field}[0].name`,
+      },
+    ];
+    for (const { properties, path } of cases) {
+      const node = memberNode(nodeKind, properties);
+      expect(findApplicationFeatureSeeds([node], seed(kind))).toEqual([]);
+      expect(findApplicationFeatureSeeds([node], seed("string"))).toEqual([
+        propertyMatch(node, path),
+      ]);
+    }
+  });
+});
 
 describe("feature seed selection controls", () => {
   it.each([
@@ -147,7 +165,6 @@ describe("feature seed selection controls", () => {
     { kind: "module", nodeKind: "javascript-module", field: "original_source" },
     { kind: "native-export", nodeKind: "native-export", field: "label" },
     { kind: "native-export", nodeKind: "native-export", field: "key" },
-    { kind: "route", nodeKind: "endpoint", field: "label" },
     { kind: "route", nodeKind: "endpoint", field: "value" },
     { kind: "route", nodeKind: "endpoint", field: "path" },
     { kind: "channel", nodeKind: "ipc-channel", field: "label" },
@@ -173,6 +190,30 @@ describe("feature seed selection controls", () => {
       ]);
     },
   );
+
+  it("excludes route labels while preserving generic scalar and array matching", () => {
+    const scalar = memberNode("endpoint", {
+      endpoint_kind: "route",
+      label: "route endpoint",
+    });
+    const array = memberNode("endpoint", {
+      endpoint_kind: "route",
+      label: ["route endpoint"],
+    });
+
+    expect(
+      findApplicationFeatureSeeds([scalar], seed("route", "route endpoint")),
+    ).toEqual([]);
+    expect(
+      findApplicationFeatureSeeds([array], seed("route", "route endpoint")),
+    ).toEqual([]);
+    expect(
+      findApplicationFeatureSeeds([scalar], seed("string", "route endpoint")),
+    ).toEqual([propertyMatch(scalar, "label")]);
+    expect(
+      findApplicationFeatureSeeds([array], seed("string", "route endpoint")),
+    ).toEqual([propertyMatch(array, "label[0]")]);
+  });
 
   it("keeps generic matching and scalar label and identity selection", () => {
     const node = memberNode("context-bridge-api", { members: ["openProject"] });
@@ -252,8 +293,8 @@ describe("feature seed selection controls", () => {
   );
 });
 
-describe("public feature trace from contextBridge source members", () => {
-  it("traces one exact member seed through the public feature workflow", () => {
+describe("feature trace projection from contextBridge source members", () => {
+  it("traces one exact member seed while preserving projection facts", () => {
     const mode = {
       value: "openProject",
       match: "exact" as const,
@@ -323,8 +364,10 @@ describe("public feature trace from contextBridge source members", () => {
       total_seed_matches: 0,
     });
     expect(result.evidence_links).toEqual([sourceEvidenceId]);
-    expect(result.limitations).toContain(
-      "No graph entity matched the literal seed; this is not evidence that the feature is absent.",
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /no application graph entity matched.*not evidence.*feature is absent/iu,
+      ),
     );
   });
 
@@ -355,8 +398,10 @@ describe("public feature trace from contextBridge source members", () => {
     });
     expect(result.graph?.coverage).toEqual(partialGraph.coverage);
     expect(result.graph?.nodes).toEqual(partialGraph.nodes);
-    expect(result.limitations).toContain(
-      "The source application graph is incomplete; unmatched seeds and frontiers remain unknown.",
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /source application graph.*incomplete.*unmatched seeds and frontiers.*unknown/iu,
+      ),
     );
   });
 });
@@ -366,12 +411,13 @@ const sourceEvidenceId = `ev_${"b".repeat(64)}`;
 const seed = (
   kind: ApplicationFeatureSeed["kind"],
   value = "openProject",
-): ApplicationFeatureSeed => ({
-  kind,
-  value,
-  match: "exact",
-  case_sensitive: true,
-});
+): ApplicationFeatureSeed =>
+  applicationFeatureSeedSchema.parse({
+    kind,
+    value,
+    match: "exact",
+    case_sensitive: true,
+  });
 
 const memberNode = (
   kind: ApplicationNode["kind"],
@@ -409,8 +455,8 @@ const propertyMatch = (node: ApplicationNode, field: string) => ({
 });
 
 const contextBridgeGraph = () => {
-  const analysis = analyzeJavaScriptStaticSource(
-    "contextBridge.exposeInMainWorld('desktopApi', { openProject() {}, closeProject() {} });",
+  const analysis = analyzeCommonJsStaticFixture(
+    "const { contextBridge } = require('electron');\ncontextBridge.exposeInMainWorld('desktopApi', { openProject() {}, closeProject() {} });",
   );
   expect(analysis.parse_status).toBe("complete");
   const finding = analysis.electron.context_bridge_apis[0];

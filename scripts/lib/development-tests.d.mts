@@ -11,11 +11,13 @@ export function parseDevelopmentTestRequest(
   arguments_: readonly string[],
 ): DevelopmentTestRequest;
 
-/** Plan source feedback or a strict explicit run with its build prerequisite. */
+/** Plan source feedback or explicit tests with runtime/artifact prerequisites. */
 export function developmentTestPlan(
   request: DevelopmentTestRequest,
   baseCommit?: string,
+  resolvedPaths?: readonly string[],
 ): {
   readonly needsBuild: boolean;
+  readonly artifactTasks: readonly string[];
   readonly vitestArguments: readonly string[];
 };

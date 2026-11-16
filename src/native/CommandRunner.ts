@@ -1,9 +1,38 @@
+import type { ProcessInspectionFailure } from "../process/ProcessInspectionCleanup.js";
+import { processInspectionFailure } from "../providers/OwnedCommandCleanup.js";
+import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { realpath } from "node:fs/promises";
-import { spawn } from "node:child_process";
 
 import { err, ok, type Result } from "../domain/result.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessRunTokenReader.js";
+import {
+  OwnedCommandFailure,
+  runOwnedCommand,
+} from "../process/OwnedCommand.js";
+import type {
+  OwnedProviderProcessSpawnOptions,
+  ProviderProcessSnapshot,
+  ProviderProcessSupervisor,
+  SpawnedOwnedProviderProcess,
+} from "../process/ProviderProcess.js";
+import { utf8HeadExcerpt } from "../domain/utf8HeadExcerpt.js";
+import { DEFAULT_NATIVE_COMMAND_TIMEOUT_MS } from "../domain/native/nativeDeadlines.js";
+import {
+  selectArtifactCommandPath,
+  type ArtifactCommandPath,
+} from "../process/ArtifactCommandPath.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+
+/** Retain complete command output up to a bounded aggregate size. */
+export const NATIVE_COMMAND_OUTPUT_BUDGET_BYTES = 64 * 1024 * 1024;
+/**
+ * Failure diagnostics keep only an excerpt of each stream. Successful
+ * analysis needs complete output, but a failed command's error would
+ * otherwise repeat up to the whole output budget to the caller.
+ */
+export const NATIVE_FAILURE_DIAGNOSTIC_BYTES = 64 * 1024;
 
 export interface NativeCommandCapture {
   readonly tool: string;
@@ -20,21 +49,86 @@ export interface NativeCommandCapture {
   readonly signal: string | null;
 }
 
+/** Native command failure with retained partial output and cleanup status. */
 export class NativeCommandFailure extends Error {
+  /** Caller-owned cancellation fact retained separately from the physical cause. */
+  readonly cancellation: { readonly reason: unknown } | undefined;
+  readonly cleanupOwner: ProviderProcessSupervisor | undefined;
+  readonly cleanupFailures: readonly NativeCommandCleanupFailure[];
+  readonly cleanupMarker: ProviderCleanupError | undefined;
+  readonly detail: string | null;
+  readonly preparationFailure: ProcessInspectionFailure | undefined;
+
   constructor(
     readonly tool: string,
-    readonly reason: "unavailable" | "cancelled" | "nonzero-exit" | "io",
+    readonly reason:
+      | "unavailable"
+      | "cancelled"
+      | "timeout"
+      | "output-limit"
+      | "nonzero-exit"
+      | "io",
     readonly exitCode: number | null = null,
-    options?: ErrorOptions,
+    options?: NativeCommandFailureOptions,
+    readonly capture: NativeCommandFailureCapture | null = null,
+    readonly cleanupFailure: string | null = null,
+    readonly cleanupResources: readonly string[] = [],
   ) {
     super(`Native command ${tool} failed: ${reason}`, options);
+    this.cancellation =
+      options?.cancellation === undefined
+        ? undefined
+        : { reason: options.cancellation.reason };
+    this.cleanupOwner = options?.cleanupOwner;
+    this.cleanupFailures = options?.cleanupFailures ?? [];
+    this.cleanupMarker = options?.cleanupMarker;
+    this.preparationFailure =
+      options?.cause instanceof NativeCommandFailure
+        ? options.cause.preparationFailure
+        : processInspectionFailure(options?.cause);
+    this.detail = options?.detail ?? this.preparationFailure?.message ?? null;
   }
+}
+
+/** Named cleanup ownership carried alongside the ordinary error cause. */
+interface NativeCommandFailureOptions extends ErrorOptions {
+  /** Exact opaque reason recorded by the cancellation-owning boundary. */
+  readonly cancellation?: { readonly reason: unknown };
+  /** Typed owner retained when command process cleanup was incomplete. */
+  readonly cleanupOwner?: ProviderProcessSupervisor;
+  /** All owners still incomplete after a preflight retry blocked this command. */
+  readonly cleanupFailures?: readonly NativeCommandCleanupFailure[];
+  /** Exact cleanup error resolved only by a successful retry of its owner. */
+  readonly cleanupMarker?: ProviderCleanupError;
+  /** Host-side reason the command could not be supervised, such as a missing ownership helper compiler. */
+  readonly detail?: string;
+}
+
+/** One failed cleanup attempt; the runner retains `owner` until it is verified stopped. */
+export interface NativeCommandCleanupFailure {
+  readonly owner: ProviderProcessSupervisor;
+  readonly reason: string;
+  readonly resources: readonly string[];
+  readonly marker?: ProviderCleanupError;
+}
+
+/** Partial output and lifecycle details retained when a native command fails. */
+interface NativeCommandFailureCapture {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly stdoutBytes: number;
+  readonly stderrBytes: number;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly truncated: boolean;
 }
 
 /** Cancellation and exit handling for one allowlisted native command. */
 export interface NativeCommandOptions {
   readonly signal?: AbortSignal;
   readonly acceptNonZero?: boolean;
+  /** Selected wall clock; omitted uses `DEFAULT_NATIVE_COMMAND_TIMEOUT_MS`. */
+  readonly timeoutMs?: number;
 }
 
 export interface NativeCommandRunner {
@@ -43,22 +137,44 @@ export interface NativeCommandRunner {
     arguments_: readonly string[],
     options: NativeCommandOptions,
   ): Promise<Result<NativeCommandCapture, NativeCommandFailure>>;
+  /** Retry only owners from completed commands whose cleanup was incomplete. */
+  retryCleanup?(): Promise<readonly NativeCommandCleanupFailure[]>;
 }
 
-/** Resolve one allowlisted native tool to an immutable executable identity. */
-export type NativeToolResolver = (
+/** Optional launch seam for production-boundary lifecycle verification. */
+export type NativeCommandLauncher = (
+  options: OwnedProviderProcessSpawnOptions,
+) => Promise<SpawnedOwnedProviderProcess>;
+
+/** Resolve one native tool's selected invocation and prelaunch file identity. */
+type NativeToolResolver = (
   tool: string,
   signal?: AbortSignal,
+  launcher?: NativeCommandLauncher,
+  /** Selected command deadline. Omitted uses `DEFAULT_NATIVE_COMMAND_TIMEOUT_MS`. */
+  timeoutMs?: number,
 ) => Promise<Result<ResolvedTool, NativeCommandFailure>>;
 
 /** Run allowlisted Xcode tools directly without a shell. */
 export class XcrunCommandRunner implements NativeCommandRunner {
-  readonly #resolved = new Map<string, ResolvedTool>();
-
+  private readonly environment: NodeJS.ProcessEnv;
+  readonly #cleanupMarkers = new Map<
+    ProviderProcessSupervisor,
+    ProviderCleanupError
+  >();
+  #cleanupAttempt: Promise<readonly NativeCommandCleanupFailure[]> | undefined;
   constructor(
-    private readonly resolveTool: NativeToolResolver = (tool, signal) =>
-      resolveXcrunTool(tool, signal),
-  ) {}
+    environment: Readonly<NodeJS.ProcessEnv>,
+    private readonly resolveTool: NativeToolResolver = (
+      tool,
+      signal,
+      launcher,
+      timeoutMs,
+    ) => resolveXcrunTool(tool, this.environment, signal, launcher, timeoutMs),
+    private readonly launcher?: NativeCommandLauncher,
+  ) {
+    this.environment = snapshotEnvironment(environment);
+  }
 
   run(
     tool: string,
@@ -69,44 +185,167 @@ export class XcrunCommandRunner implements NativeCommandRunner {
       return Promise.resolve(
         err(new NativeCommandFailure(tool, "unavailable")),
       );
-    return this.#resolve(tool, options.signal).then(async (resolved) => {
-      if (!resolved.ok) return resolved;
-      const captured = await captureProcess(
-        resolved.value.path,
-        arguments_,
-        tool,
-        options,
-      );
-      return captured.ok
-        ? ok({
-            ...captured.value,
-            tool,
-            executable: resolved.value.path,
-            executableSha256: resolved.value.sha256,
-            toolVersion: null,
-            versionReason:
-              "Tool exposes no uniform stable version flag; executable digest identifies it.",
-            arguments: [...arguments_],
-          })
-        : captured;
+    return this.#runAfterCleanup(tool, arguments_, options);
+  }
+
+  /** Retry every retained owner; a failed retry prevents another command launch. */
+  retryCleanup(): Promise<readonly NativeCommandCleanupFailure[]> {
+    if (this.#cleanupMarkers.size === 0) return Promise.resolve([]);
+    if (this.#cleanupAttempt !== undefined) return this.#cleanupAttempt;
+    this.#cleanupAttempt = this.#retryCleanup().finally(() => {
+      this.#cleanupAttempt = undefined;
+    });
+    return this.#cleanupAttempt;
+  }
+
+  async #runAfterCleanup(
+    tool: string,
+    arguments_: readonly string[],
+    options: NativeCommandOptions,
+  ): Promise<Result<NativeCommandCapture, NativeCommandFailure>> {
+    const pendingFailures = await this.retryCleanup();
+    if (pendingFailures.length > 0)
+      return err(commandCleanupFailure(tool, pendingFailures));
+    const resolved = await this.resolveTool(
+      tool,
+      options.signal,
+      this.launcher,
+      options.timeoutMs,
+    );
+    if (!resolved.ok) {
+      return err(this.#retainCleanupOwner(resolved.error));
+    }
+    const captured = await captureProcess(
+      resolved.value.invocationPath,
+      arguments_,
+      tool,
+      options,
+      this.environment,
+      this.launcher,
+    );
+    if (!captured.ok) return err(this.#retainCleanupOwner(captured.error));
+    return ok({
+      ...captured.value,
+      tool,
+      executable: resolved.value.invocationPath,
+      executableSha256: resolved.value.sha256,
+      toolVersion: null,
+      versionReason:
+        "Tool exposes no uniform stable version flag; executable SHA-256 is a prelaunch file sample and does not prove atomic OS image binding.",
+      arguments: [...arguments_],
     });
   }
 
-  async #resolve(
-    tool: string,
-    signal?: AbortSignal,
-  ): Promise<Result<ResolvedTool, NativeCommandFailure>> {
-    const existing = this.#resolved.get(tool);
-    if (existing !== undefined) return ok(existing);
-    const resolved = await this.resolveTool(tool, signal);
-    if (resolved.ok) this.#resolved.set(tool, resolved.value);
-    return resolved;
+  async #retryCleanup(): Promise<readonly NativeCommandCleanupFailure[]> {
+    const failures: NativeCommandCleanupFailure[] = [];
+    for (const [owner, marker] of this.#cleanupMarkers) {
+      let reason: string | undefined;
+      try {
+        const stopped = await owner.stop();
+        if (stopped.status === "not-owned") {
+          reason = "native command ownership remains unresolved";
+        } else if (stopped.status !== "incomplete") {
+          marker.resolveCleanup();
+          this.#cleanupMarkers.delete(owner);
+          continue;
+        } else
+          reason =
+            stopped.reason || "native command cleanup remains unverified";
+      } catch (cause: unknown) {
+        reason =
+          cause instanceof Error
+            ? cause.message || cause.name
+            : String(cause) || "native command cleanup failed unexpectedly";
+      }
+      failures.push({
+        owner,
+        reason: reason ?? "native command cleanup remains unverified",
+        resources: commandProcessResources(owner),
+        marker,
+      });
+    }
+    return failures;
+  }
+
+  #retainCleanupOwner(failure: NativeCommandFailure): NativeCommandFailure {
+    const owner = failure.cleanupOwner;
+    if (owner === undefined) return failure;
+    let marker = failure.cleanupMarker ?? this.#cleanupMarkers.get(owner);
+    if (marker === undefined) {
+      marker = new ProviderCleanupError(
+        "native-macos",
+        commandProcessResources(owner),
+        {
+          reason:
+            failure.cleanupFailure ??
+            "native command cleanup remains incomplete",
+        },
+        { operation: "native_command", cause: failure },
+      );
+    }
+    this.#cleanupMarkers.set(owner, marker);
+    if (failure.cleanupMarker === marker) return failure;
+    return new NativeCommandFailure(
+      failure.tool,
+      failure.reason,
+      failure.exitCode,
+      {
+        cause: failure,
+        ...(failure.cancellation === undefined
+          ? {}
+          : { cancellation: failure.cancellation }),
+        cleanupOwner: owner,
+        cleanupFailures: failure.cleanupFailures,
+        cleanupMarker: marker,
+        ...(failure.detail === null ? {} : { detail: failure.detail }),
+      },
+      failure.capture,
+      failure.cleanupFailure,
+      failure.cleanupResources,
+    );
   }
 }
 
-/** Immutable executable identity returned by native tool discovery. */
-export interface ResolvedTool {
-  readonly path: string;
+const commandProcessResources = (
+  owner: ProviderProcessSupervisor,
+): readonly string[] => {
+  const ownership = owner.launch.ownership;
+  return ownership === undefined
+    ? ["native-command-process"]
+    : [
+        ownership.runId,
+        `pid:${String(ownership.leaderPid)}`,
+        `process-group:${String(ownership.processGroupId)}`,
+      ];
+};
+
+const commandCleanupFailure = (
+  tool: string,
+  failures: readonly NativeCommandCleanupFailure[],
+): NativeCommandFailure =>
+  new NativeCommandFailure(
+    tool,
+    "io",
+    null,
+    {
+      cleanupFailures: failures,
+      cause: new AggregateError(
+        failures.map(
+          ({ reason, resources }) =>
+            new Error(`${reason} (${resources.join(", ")})`),
+        ),
+        "Previously owned native command cleanup remains incomplete",
+      ),
+    },
+    null,
+    failures
+      .map(({ reason, resources }) => `${resources.join(", ")}: ${reason}`)
+      .join("; "),
+    [...new Set(failures.flatMap(({ resources }) => resources))],
+  );
+
+/** Selected invocation and physical executable identity sampled during resolution. */
+export interface ResolvedTool extends ArtifactCommandPath {
   readonly sha256: string;
 }
 
@@ -117,38 +356,114 @@ const ALLOWED_TOOLS = new Set([
   "file",
   "lipo",
   "nm",
-  "otool",
   "plutil",
   "strings",
   "swift-demangle",
   "vtool",
 ]);
 
-const resolveXcrunTool = async (
+/** Locate an Xcode tool through `xcrun --find` and sample its executable digest. */
+export const resolveXcrunTool = async (
   tool: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
   signal?: AbortSignal,
+  launcher?: NativeCommandLauncher,
+  timeoutMs?: number,
 ): Promise<Result<ResolvedTool, NativeCommandFailure>> => {
   const found = await captureProcess(
     "/usr/bin/xcrun",
     ["--find", tool],
     "xcrun",
-    signal === undefined ? {} : { signal },
+    {
+      ...(signal === undefined ? {} : { signal }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    },
+    environment,
+    launcher,
   );
   if (!found.ok) {
-    if (found.error.reason === "cancelled")
-      return err(new NativeCommandFailure(tool, "cancelled"));
-    return err(new NativeCommandFailure(tool, "unavailable"));
+    return err(
+      new NativeCommandFailure(
+        tool,
+        found.error.reason === "nonzero-exit" ||
+          found.error.reason === "unavailable"
+          ? "unavailable"
+          : found.error.reason,
+        found.error.exitCode,
+        {
+          cause: found.error,
+          ...(found.error.cleanupOwner === undefined
+            ? {}
+            : { cleanupOwner: found.error.cleanupOwner }),
+          ...(found.error.cleanupFailures.length === 0
+            ? {}
+            : { cleanupFailures: found.error.cleanupFailures }),
+          ...(found.error.cleanupMarker === undefined
+            ? {}
+            : { cleanupMarker: found.error.cleanupMarker }),
+          ...(found.error.cancellation === undefined
+            ? {}
+            : { cancellation: found.error.cancellation }),
+          ...(found.error.detail === null
+            ? {}
+            : { detail: found.error.detail }),
+        },
+        found.error.capture,
+        found.error.cleanupFailure,
+        found.error.cleanupResources,
+      ),
+    );
   }
   if (found.value.exitCode !== 0)
-    return err(new NativeCommandFailure(tool, "unavailable"));
+    return err(
+      new NativeCommandFailure(
+        tool,
+        "unavailable",
+        found.value.exitCode,
+        undefined,
+        failureCapture(found.value, false),
+      ),
+    );
   const candidate = found.value.stdout.trim();
   if (!candidate.startsWith("/"))
-    return err(new NativeCommandFailure(tool, "unavailable"));
+    return err(
+      new NativeCommandFailure(
+        tool,
+        "unavailable",
+        found.value.exitCode,
+        undefined,
+        failureCapture(found.value, false),
+      ),
+    );
   try {
-    const path = await realpath(candidate);
-    return ok({ path, sha256: await hashFile(path) });
+    const selected = await selectArtifactCommandPath(candidate, signal);
+    return ok({
+      ...selected,
+      sha256: await hashFile(selected.resolvedPath, signal),
+    });
   } catch (cause: unknown) {
-    return err(new NativeCommandFailure(tool, "io", null, { cause }));
+    const capture = failureCapture(found.value, false);
+    const cancellation =
+      signal?.aborted === true ? { reason: signal.reason } : undefined;
+    const observedCancellation =
+      signal?.aborted === true &&
+      cause instanceof Error &&
+      cause.cause === signal.reason &&
+      ((cause instanceof ArtifactReaderFailure &&
+        cause.reason === "cancelled") ||
+        ("code" in cause && cause.code === "ABORT_ERR"));
+    return err(
+      new NativeCommandFailure(
+        tool,
+        observedCancellation ? "cancelled" : "io",
+        capture.exitCode,
+        {
+          cause,
+          ...(cancellation === undefined ? {} : { cancellation }),
+        },
+        capture,
+      ),
+    );
   }
 };
 
@@ -162,88 +477,137 @@ type ProcessCapture = Omit<
   | "arguments"
 >;
 
-const captureProcess = (
+/** Bound one command's output for failure diagnostics, keeping observed byte totals. */
+export const failureCapture = (
+  capture: ProcessCapture,
+  truncated: boolean,
+): NativeCommandFailureCapture => {
+  const stdout = utf8HeadExcerpt(
+    capture.stdout,
+    NATIVE_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  const stderr = utf8HeadExcerpt(
+    capture.stderr,
+    NATIVE_FAILURE_DIAGNOSTIC_BYTES,
+  );
+  return {
+    stdout: stdout.text,
+    stderr: stderr.text,
+    // Byte counts stay the observed totals, not the excerpt lengths.
+    stdoutBytes: capture.stdoutBytes,
+    stderrBytes: capture.stderrBytes,
+    exitCode: capture.exitCode,
+    signal: capture.signal,
+    truncated: truncated || stdout.truncated || stderr.truncated,
+  };
+};
+
+const captureProcess = async (
   executable: string,
   arguments_: readonly string[],
   tool: string,
   options: {
     readonly signal?: AbortSignal;
     readonly acceptNonZero?: boolean;
+    readonly timeoutMs?: number;
   },
-): Promise<Result<ProcessCapture, NativeCommandFailure>> =>
-  new Promise((resolve) => {
-    if (options.signal?.aborted === true) {
-      resolve(err(new NativeCommandFailure(tool, "cancelled")));
-      return;
-    }
-    const runToken = randomUUID();
-    const child = spawn(executable, [...arguments_], {
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
-        LC_ALL: "C",
-        LANG: "C",
-        REA_NATIVE_RUN_TOKEN: runToken,
+  environment: Readonly<NodeJS.ProcessEnv>,
+  launcher?: NativeCommandLauncher,
+): Promise<Result<ProcessCapture, NativeCommandFailure>> => {
+  const runId = `rea-native-command-${randomUUID()}`;
+  try {
+    const snapshot = await runOwnedCommand(
+      {
+        command: executable,
+        arguments: [...arguments_],
+        runId,
+        env: {
+          LC_ALL: "C",
+          LANG: "C",
+        },
+        hostEnvironment: environment,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let settled = false;
-    let reason: NativeCommandFailure["reason"] | undefined;
-    const finish = (
-      result: Result<ProcessCapture, NativeCommandFailure>,
-    ): void => {
-      if (settled) return;
-      settled = true;
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve(result);
-    };
-    const stop = (failure: NativeCommandFailure["reason"]): void => {
-      reason ??= failure;
-      child.kill("SIGKILL");
-    };
-    const onAbort = (): void => stop("cancelled");
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.length;
-      stdout.push(chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.length;
-      stderr.push(chunk);
-    });
-    child.once("error", (cause: unknown) =>
-      finish(err(new NativeCommandFailure(tool, "io", null, { cause }))),
+      {
+        timeoutMs: options.timeoutMs ?? DEFAULT_NATIVE_COMMAND_TIMEOUT_MS,
+        diagnosticBytes: NATIVE_COMMAND_OUTPUT_BUDGET_BYTES,
+        acceptNonZeroExit: options.acceptNonZero === true,
+      },
+      launcher === undefined ? {} : { launcher },
     );
-    child.once("close", (code, signal) => {
-      if (reason !== undefined) {
-        finish(err(new NativeCommandFailure(tool, reason, code)));
-        return;
-      }
-      if (signal !== null || (code !== 0 && options.acceptNonZero !== true)) {
-        finish(err(new NativeCommandFailure(tool, "nonzero-exit", code)));
-        return;
-      }
-      finish(
-        ok({
-          stdout: Buffer.concat(stdout).toString("utf8"),
-          stderr: Buffer.concat(stderr).toString("utf8"),
-          stdoutBytes,
-          stderrBytes,
-          exitCode: code,
-          signal,
-        }),
+    return ok(processCaptureFromSnapshot(snapshot));
+  } catch (cause: unknown) {
+    if (cause instanceof OwnedCommandFailure) {
+      const capture =
+        cause.snapshot === null
+          ? null
+          : failureCapture(
+              processCaptureFromSnapshot(cause.snapshot),
+              cause.snapshot.diagnosticTruncated === true,
+            );
+      return err(
+        new NativeCommandFailure(
+          tool,
+          cause.reason === "process"
+            ? processFailureReason(capture)
+            : cause.reason,
+          capture?.exitCode ?? null,
+          {
+            cause,
+            ...(cause.cancellation === undefined
+              ? {}
+              : { cancellation: cause.cancellation }),
+            ...(cause.cleanupOwner === undefined
+              ? {}
+              : { cleanupOwner: cause.cleanupOwner }),
+          },
+          capture,
+          cause.cleanupFailure,
+          cause.resources,
+        ),
       );
-    });
-  });
+    }
+    return err(
+      new NativeCommandFailure(
+        tool,
+        cause instanceof DarwinProcessOwnershipInspectionError &&
+          cause.cancellation !== undefined
+          ? "cancelled"
+          : "io",
+        null,
+        { cause },
+      ),
+    );
+  }
+};
 
-const hashFile = (path: string): Promise<string> =>
+const processFailureReason = (
+  capture: NativeCommandFailureCapture | null,
+): "io" | "nonzero-exit" =>
+  capture !== null &&
+  (capture.signal !== null ||
+    (capture.exitCode !== null && capture.exitCode !== 0))
+    ? "nonzero-exit"
+    : "io";
+
+const processCaptureFromSnapshot = (
+  snapshot: ProviderProcessSnapshot,
+): ProcessCapture => ({
+  stdout: snapshot.stdout.text,
+  stderr: snapshot.stderr.text,
+  stdoutBytes: snapshot.stdout.bytes,
+  stderrBytes: snapshot.stderr.bytes,
+  exitCode: snapshot.exitCode ?? null,
+  signal: snapshot.signal ?? null,
+});
+
+const hashFile = (path: string, signal?: AbortSignal): Promise<string> =>
   new Promise((resolve, reject) => {
     const hash = createHash("sha256");
-    const stream = createReadStream(path);
+    const stream = createReadStream(
+      path,
+      signal === undefined ? undefined : { signal },
+    );
     stream.on("data", (chunk) => hash.update(chunk));
     stream.once("error", reject);
     stream.once("end", () => resolve(hash.digest("hex")));

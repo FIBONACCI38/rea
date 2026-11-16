@@ -1,17 +1,27 @@
 import { describe, expect, it } from "vitest";
 
 import { createEvidence, type Evidence } from "./evidence.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
+import { compareArtifacts } from "./artifactComparison.js";
+import { readComparisonResult } from "./comparisonEvidenceResult.js";
+import { artifactInventoryResultSchema } from "./artifactGraph.js";
+import { artifactGraphDigest, artifactManifestId } from "./artifactIdentity.js";
 import { createEvidenceBundle } from "./evidenceBundle.js";
+import { EvidenceIntegrityError } from "./evidenceErrors.js";
 import {
   reconstructionVerificationResultSchema,
-  verifyReconstruction,
-} from "./reconstructionVerification.js";
-import type { JsonValue } from "./jsonValue.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./process/processCapture.fixture.js";
-import { reconstructionSpecificationSchema } from "./reconstructionVerificationSchemas.js";
+  reconstructionSpecificationSchema,
+} from "./reconstructionVerificationSchemas.js";
+import {
+  jsonObjectSchema,
+  jsonValueSchema,
+  type JsonValue,
+} from "./jsonValue.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./process/processCaptureExample.js";
 import { ARTIFACT_COMPARISON_EXAMPLE } from "../contracts/artifactComparisonExample.js";
 import { createResidualUnknown } from "./residualUnknown.js";
 
+import { verifyReconstruction } from "./reconstructionVerification.js";
 const environment = {
   id: "fixture-linux",
   platform: "linux",
@@ -23,7 +33,13 @@ const source = (
   digit: string,
   authority: "controlled-replay" | "shipped-artifact",
   confidence: "observed" | "derived" = "observed",
-  captureResult: JsonValue = EMPTY_PROCESS_CAPTURE_EXAMPLE,
+  {
+    captureResult = EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    replayEnvironment = environment,
+  }: {
+    readonly captureResult?: JsonValue;
+    readonly replayEnvironment?: typeof environment | null;
+  } = {},
 ): Evidence =>
   createEvidence(
     {
@@ -45,7 +61,7 @@ const source = (
       result: authority === "controlled-replay" ? captureResult : { digit },
       confidence,
       authority,
-      environment: authority === "controlled-replay" ? environment : null,
+      environment: authority === "controlled-replay" ? replayEnvironment : null,
     },
   );
 
@@ -115,6 +131,31 @@ const processComparison = (
     },
   );
 
+const multiSourceProcessComparison = (
+  left: readonly Evidence[],
+  right: readonly Evidence[],
+): Evidence =>
+  createEvidence(
+    undefined,
+    {
+      id: "rea-process",
+      name: "REA deterministic process harness",
+      version: "3",
+    },
+    {
+      predicateType: "rea.process-comparison",
+      operation: "compare_process_captures",
+      parameters: {
+        left_evidence_ids: left.map(({ evidence_id: id }) => id),
+        right_evidence_ids: right.map(({ evidence_id: id }) => id),
+      },
+      result: processResult(),
+      confidence: "derived",
+      authority: "analyst-inference",
+      evidenceLinks: [...left, ...right].map(({ evidence_id: id }) => id),
+    },
+  );
+
 const behavioralSpec = (comparison: Evidence) => ({
   name: "CLI compatibility",
   claims: [
@@ -163,6 +204,7 @@ const artifactComparison = (
   left: Evidence,
   right: Evidence,
   partial = false,
+  result?: JsonValue,
 ): Evidence =>
   createEvidence(
     undefined,
@@ -178,12 +220,42 @@ const artifactComparison = (
         left_evidence_ids: [left.evidence_id],
         right_evidence_ids: [right.evidence_id],
       },
-      result: artifactResult(partial, [left.evidence_id, right.evidence_id]),
+      result: result ?? {
+        ...(artifactResult(partial, [
+          left.evidence_id,
+          right.evidence_id,
+        ]) as Record<string, JsonValue>),
+        left_manifest_id: compareArtifacts(left, right).left_manifest_id,
+        right_manifest_id: compareArtifacts(left, right).right_manifest_id,
+      },
       confidence: "derived",
       authority: "analyst-inference",
       evidenceLinks: [left.evidence_id, right.evidence_id],
     },
   );
+
+const verifyArtifactComparison = (
+  left: Evidence,
+  right: Evidence,
+  result: JsonValue,
+) => {
+  const comparison = artifactComparison(left, right, false, result);
+  return verifyReconstruction(
+    {
+      name: "Artifact structure",
+      claims: [
+        {
+          kind: "structural-artifact",
+          claim_id: "artifact-graph",
+          title: "Artifact graph remains equal",
+          comparison_evidence_id: comparison.evidence_id,
+          dimension: "overall",
+        },
+      ],
+    },
+    createEvidenceBundle([left, right, comparison]),
+  );
+};
 
 describe("reconstruction verification", () => {
   it("accepts real process dimensions and rejects removed protocol dimensions", () => {
@@ -288,46 +360,93 @@ describe("reconstruction verification", () => {
   });
 });
 
-describe("saved v3 reconstruction capture compatibility", () => {
-  it("verifies saved v3 process captures and rejects a malformed legacy digest", () => {
-    const legacy = legacyV3Capture();
-    const left = source("1", "controlled-replay", "observed", legacy);
+describe("reconstruction process capture input", () => {
+  it("rejects saved captures without explicit executable identity", () => {
+    const left = source("1", "controlled-replay", "observed", {
+      captureResult: legacyV3Capture(),
+    });
     const right = source("2", "controlled-replay");
     const comparison = processComparison(left, right, processResult());
-    const bundle = createEvidenceBundle([comparison, left, right]);
-
-    expect(
-      verifyReconstruction(behavioralSpec(comparison), bundle),
-    ).toMatchObject({
-      status: "pass",
-      summary: { total: 1, passed: 1, failed: 0, unknown: 0 },
-    });
-
-    const malformedLegacy = {
-      ...legacy,
-      manifest: { ...legacy.manifest, executable_sha256: null },
-    };
-    const malformedLeft = source(
-      "3",
-      "controlled-replay",
-      "observed",
-      malformedLegacy,
-    );
-    const malformedComparison = processComparison(
-      malformedLeft,
-      right,
-      processResult(),
-    );
     expect(() =>
       verifyReconstruction(
-        behavioralSpec(malformedComparison),
-        createEvidenceBundle([malformedComparison, malformedLeft, right]),
+        behavioralSpec(comparison),
+        createEvidenceBundle([comparison, left, right]),
       ),
-    ).toThrow();
+    ).toThrow(EvidenceIntegrityError);
   });
 });
 
+it("reports a missing comparison reference as caller input with its claim path", () => {
+  const left = source("1", "controlled-replay");
+  const right = source("2", "controlled-replay");
+  const comparison = processComparison(left, right, processResult());
+  try {
+    verifyReconstruction(
+      behavioralSpec(comparison),
+      createEvidenceBundle([left, right]),
+    );
+    throw new Error("Expected a missing comparison reference to be rejected");
+  } catch (error: unknown) {
+    expect(error).toBeInstanceOf(AnalysisInputError);
+    if (!(error instanceof AnalysisInputError)) throw error;
+    expect(error).toMatchObject({
+      issues: [
+        {
+          path: ["claims", 0, "comparison_evidence_id"],
+          reason: "invalid_value",
+        },
+      ],
+    });
+    expect(error.userMessage).toContain(comparison.evidence_id);
+    expect(error.userMessage).toMatch(/missing.*comparison/iu);
+    expect(error.issues[0]?.message).toBe(error.userMessage);
+  }
+});
+
 describe("reconstruction verification outcomes", () => {
+  it("requires every selected behavioral source to share a replay environment", () => {
+    const replay = (digit: string, id: string | null) =>
+      source(digit, "controlled-replay", "observed", {
+        replayEnvironment: id === null ? null : { ...environment, id },
+      });
+    const verify = (left: readonly Evidence[], right: readonly Evidence[]) => {
+      const comparison = multiSourceProcessComparison(left, right);
+      return verifyReconstruction(
+        behavioralSpec(comparison),
+        createEvidenceBundle([...left, ...right, comparison]),
+      );
+    };
+    const limitation =
+      "Controlled replay environments are unavailable or incompatible.";
+    const differentOnLeft = verify(
+      [replay("1", "env-a"), replay("2", "env-b")],
+      [replay("3", "env-a"), replay("4", "env-a")],
+    );
+    expect(differentOnLeft.status).toBe("unknown");
+    expect(differentOnLeft.claims.items[0]?.limitations).toContain(limitation);
+
+    const differentOnRight = verify(
+      [replay("5", "env-a"), replay("6", "env-a")],
+      [replay("7", "env-a"), replay("8", "env-b")],
+    );
+    expect(differentOnRight.status).toBe("unknown");
+    expect(differentOnRight.claims.items[0]?.limitations).toContain(limitation);
+
+    const unavailable = verify(
+      [replay("9", "env-a"), replay("a", "env-a")],
+      [replay("b", "env-a"), replay("c", null)],
+    );
+    expect(unavailable.status).toBe("unknown");
+    expect(unavailable.claims.items[0]?.limitations).toContain(limitation);
+
+    expect(
+      verify(
+        [replay("d", "env-a"), replay("e", "env-a")],
+        [replay("f", "env-a"), replay("0", "env-a")],
+      ).status,
+    ).toBe("pass");
+  });
+
   it("fails an authoritative observed disagreement", () => {
     const left = source("1", "controlled-replay");
     const right = source("2", "controlled-replay");
@@ -341,6 +460,45 @@ describe("reconstruction verification outcomes", () => {
       summary: { failed: 1 },
       claims: { items: [{ status: "fail", observed_status: "changed" }] },
     });
+  });
+
+  it("rejects an unchanged artifact aggregate that disagrees with retained changes", () => {
+    const left = ARTIFACT_COMPARISON_EXAMPLE.left;
+    const right = ARTIFACT_COMPARISON_EXAMPLE.right;
+    const changed = compareArtifacts(left, right);
+    expect(changed.status).toBe("changed");
+    expect(changed.changes).toHaveLength(1);
+    expect(changed.changes[0]?.classification).toBe("changed");
+    const inconsistentResults = [
+      jsonValueSchema.parse({ ...changed, status: "unchanged" }),
+      jsonValueSchema.parse({ ...changed, status: "unchanged", changes: [] }),
+      jsonValueSchema.parse({
+        ...jsonObjectSchema.parse(artifactResult(false)),
+        integrity_mismatch_evidence_ids: [left.evidence_id],
+      }),
+    ];
+
+    for (const result of inconsistentResults)
+      expect(() => verifyArtifactComparison(left, right, result)).toThrow(
+        EvidenceIntegrityError,
+      );
+  });
+
+  it("preserves unknown artifact rows with known dimensions and validates integrity citations", () => {
+    const left = ARTIFACT_COMPARISON_EXAMPLE.left;
+    const right = ARTIFACT_COMPARISON_EXAMPLE.right;
+    const result = jsonObjectSchema.parse(
+      artifactResult(true, [left.evidence_id, right.evidence_id]),
+    );
+    result.status = "unknown";
+    const rows = result.changes as Array<Record<string, JsonValue>>;
+    rows[0]!.dimensions = ["availability", "metadata", "executable"];
+    const valid = artifactComparison(left, right, false, result);
+    expect(readComparisonResult(valid, "compare_artifacts").ok).toBe(true);
+    result.status = "contradiction";
+    result.integrity_mismatch_evidence_ids = [`ev_${"f".repeat(64)}`];
+    const unlinked = artifactComparison(left, right, false, result);
+    expect(readComparisonResult(unlinked, "compare_artifacts").ok).toBe(false);
   });
 
   it("keeps insufficient authority and partial structural evidence unknown", () => {
@@ -512,3 +670,309 @@ describe("reconstruction verification integrity", () => {
     expect(result.claims.items[0]?.unknown_ids).toHaveLength(101);
   });
 });
+
+it("keeps a valid comparison selected for the wrong claim kind as caller input", () => {
+  const left = ARTIFACT_COMPARISON_EXAMPLE.left;
+  const right = ARTIFACT_COMPARISON_EXAMPLE.right;
+  const comparison = artifactComparison(left, right, false);
+  try {
+    verifyReconstruction(
+      behavioralSpec(comparison),
+      createEvidenceBundle([left, right, comparison]),
+    );
+    throw new Error("Expected a claim-selection error");
+  } catch (cause: unknown) {
+    expect(cause).toBeInstanceOf(AnalysisInputError);
+    expect(cause).toMatchObject({
+      operation: "verify_reconstruction",
+      issues: [
+        expect.objectContaining({
+          path: ["claims", 0, "comparison_evidence_id"],
+        }),
+      ],
+    });
+  }
+});
+
+describe("retained reconstruction source coverage", () => {
+  const omittedTerminalCapture = {
+    ...EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    truncated: true,
+    truncation_details: {
+      ...EMPTY_PROCESS_CAPTURE_EXAMPLE.truncation_details,
+      raw_terminal: {
+        ...EMPTY_PROCESS_CAPTURE_EXAMPLE.truncation_details.raw_terminal,
+        observed_frames: 1,
+        observed_bytes: 1,
+      },
+    },
+  };
+
+  it("keeps old unchanged terminal and overall claims unknown while retaining unrelated claims", () => {
+    const left = source("1", "controlled-replay");
+    const right = source("2", "controlled-replay", "observed", {
+      captureResult: omittedTerminalCapture,
+    });
+    const comparison = processComparison(left, right, processResult());
+    const bundle = createEvidenceBundle([left, right, comparison]);
+    const before = JSON.stringify(bundle);
+    const result = verifyReconstruction(
+      {
+        name: "Retained capture coverage",
+        claims: ["terminal", "overall", "exit", "interaction"].map(
+          (dimension) => ({
+            kind: "behavioral",
+            claim_id: dimension,
+            title: dimension,
+            dimension,
+            comparison_evidence_id: comparison.evidence_id,
+          }),
+        ),
+      },
+      bundle,
+    );
+    expect(
+      result.claims.items.map(({ claim_id, status }) => [claim_id, status]),
+    ).toEqual([
+      ["exit", "pass"],
+      ["interaction", "pass"],
+      ["overall", "unknown"],
+      ["terminal", "unknown"],
+    ]);
+    expect(
+      result.claims.items.find(({ claim_id }) => claim_id === "terminal")
+        ?.limitations,
+    ).toContain(
+      `Source ${right.evidence_id}: terminal observation coverage is incomplete.`,
+    );
+    expect(JSON.stringify(bundle)).toBe(before);
+  });
+
+  it("retains a decisive changed claim despite omitted terminal observations", () => {
+    const left = source("1", "controlled-replay");
+    const right = source("2", "controlled-replay", "observed", {
+      captureResult: omittedTerminalCapture,
+    });
+    const comparison = processComparison(left, right, processResult("changed"));
+    const claims = ["terminal", "overall"].map((dimension) => ({
+      kind: "behavioral",
+      claim_id: dimension,
+      title: dimension,
+      dimension,
+      comparison_evidence_id: comparison.evidence_id,
+    }));
+    expect(
+      verifyReconstruction(
+        { name: "Observed disagreement", claims },
+        createEvidenceBundle([left, right, comparison]),
+      ),
+    ).toMatchObject({
+      status: "fail",
+      summary: { failed: 2, unknown: 0 },
+    });
+  });
+
+  it.each(["status", "kind"] as const)(
+    "rejects a summary inconsistent with actual claim %s",
+    (field) => {
+      const left = source("1", "controlled-replay");
+      const right = source("2", "controlled-replay");
+      const comparison = processComparison(left, right, processResult());
+      const result = verifyReconstruction(
+        behavioralSpec(comparison),
+        createEvidenceBundle([left, right, comparison]),
+      );
+      const inconsistent = {
+        ...result,
+        claims: {
+          items: result.claims.items.map((claim) =>
+            field === "status"
+              ? { ...claim, status: "fail", observed_status: "changed" }
+              : { ...claim, kind: "structural-function" },
+          ),
+        },
+      };
+      expect(
+        reconstructionVerificationResultSchema.safeParse(inconsistent).success,
+      ).toBe(false);
+    },
+  );
+});
+
+it("withholds unchanged when source inventory coverage is incomplete", () => {
+  const original = ARTIFACT_COMPARISON_EXAMPLE.left;
+  const data = {
+    ...(original.normalized_result as Record<string, JsonValue>),
+    coverage: { scope: "root", status: "unknown" },
+  };
+  const left = createEvidence(
+    { path: "fixture-left", sha256: "0".repeat(64), format: "file" },
+    original.provider,
+    {
+      operation: "inventory_artifact",
+      parameters: {},
+      result: data,
+      confidence: "observed",
+      authority: "shipped-artifact",
+    },
+  );
+  const right = ARTIFACT_COMPARISON_EXAMPLE.right;
+  const real = compareArtifacts(left, right);
+  expect(real.status).toBe("unknown");
+  expect(
+    verifyArtifactComparison(left, right, jsonValueSchema.parse(real)).status,
+  ).toBe("unknown");
+  expect(real.changes.some((row) => row.classification === "changed")).toBe(
+    true,
+  );
+  expect(
+    verifyArtifactComparison(
+      left,
+      right,
+      jsonValueSchema.parse({ ...real, status: "changed" }),
+    ).status,
+  ).toBe("unknown");
+  const fake = jsonValueSchema.parse({
+    ...real,
+    status: "unchanged",
+    changes: [],
+    summary: {
+      unchanged: 1,
+      added: 0,
+      removed: 0,
+      changed: 0,
+      unknown: 0,
+      contradiction: 0,
+    },
+  });
+  const result = verifyArtifactComparison(left, right, fake);
+  expect(result.status).toBe("unknown");
+});
+
+it.each(["unavailable", "mismatched"] as const)(
+  "withholds unchanged when source content identity is %s",
+  (hashStatus) => {
+    const original = ARTIFACT_COMPARISON_EXAMPLE.left;
+    const value = artifactInventoryResultSchema.parse(
+      original.normalized_result,
+    );
+    value.occurrences = value.occurrences.map((row) => ({
+      ...row,
+      hash_status: hashStatus,
+    }));
+    const digest = artifactGraphDigest({
+      nodes: value.nodes,
+      occurrences: value.occurrences,
+      edges: value.edges,
+      contradictions: value.integrity_contradictions,
+    });
+    value.manifest.graph_sha256 = digest;
+    value.manifest.manifest_id = artifactManifestId(
+      value.manifest.root_artifact_id,
+      digest,
+    );
+    const observe = (path: string) =>
+      createEvidence(
+        { path, sha256: "0".repeat(64), format: "file" },
+        original.provider,
+        {
+          operation: "inventory_artifact",
+          parameters: { path },
+          result: value,
+          confidence: "observed",
+          authority: "shipped-artifact",
+        },
+      );
+    const left = observe("fixture-left"),
+      right = observe("fixture-right");
+    const actual = compareArtifacts(left, right);
+    expect(actual.status).not.toBe("unchanged");
+    const claimed = jsonValueSchema.parse({
+      ...actual,
+      status: "unchanged",
+      changes: [],
+      integrity_mismatch_evidence_ids: [],
+      summary: {
+        unchanged: 1,
+        added: 0,
+        removed: 0,
+        changed: 0,
+        unknown: 0,
+        contradiction: 0,
+      },
+    });
+    expect(verifyArtifactComparison(left, right, claimed).status).toBe(
+      "unknown",
+    );
+  },
+);
+
+it("passes independently sourced, fully corroborated unchanged inventories", () => {
+  const left = ARTIFACT_COMPARISON_EXAMPLE.left;
+  const right = createEvidence(
+    { path: "independent-copy", sha256: "0".repeat(64), format: "file" },
+    left.provider,
+    {
+      operation: "inventory_artifact",
+      parameters: { path: "independent-copy" },
+      result: left.normalized_result,
+      confidence: "observed",
+      authority: "shipped-artifact",
+    },
+  );
+  const actual = compareArtifacts(left, right);
+  expect(actual.status).toBe("unchanged");
+  expect(
+    verifyArtifactComparison(left, right, jsonValueSchema.parse(actual)).status,
+  ).toBe("pass");
+  const changed = compareArtifacts(left, ARTIFACT_COMPARISON_EXAMPLE.right);
+  const inconsistent = jsonValueSchema.parse({
+    ...changed,
+    left_manifest_id: actual.left_manifest_id,
+    right_manifest_id: actual.right_manifest_id,
+    changes: changed.changes.map((row) => ({
+      ...row,
+      evidence_links: [left.evidence_id, right.evidence_id],
+    })),
+  });
+  expect(verifyArtifactComparison(left, right, inconsistent).status).toBe(
+    "unknown",
+  );
+  expect(
+    verifyArtifactComparison(
+      left,
+      ARTIFACT_COMPARISON_EXAMPLE.right,
+      jsonValueSchema.parse(changed),
+    ).status,
+  ).toBe("fail");
+});
+
+it.each(["unchanged", "unknown", "changed"] as const)(
+  "rejects incorrect source manifest identity on %s claims",
+  (status) => {
+    const left = ARTIFACT_COMPARISON_EXAMPLE.left,
+      right = ARTIFACT_COMPARISON_EXAMPLE.right;
+    const actual = compareArtifacts(left, right);
+    const claimed = jsonValueSchema.parse({
+      ...actual,
+      status,
+      left_manifest_id: `agm_${"f".repeat(64)}`,
+      ...(status === "unchanged"
+        ? {
+            changes: [],
+            summary: {
+              unchanged: 1,
+              added: 0,
+              removed: 0,
+              changed: 0,
+              unknown: 0,
+              contradiction: 0,
+            },
+          }
+        : {}),
+    });
+    expect(() => verifyArtifactComparison(left, right, claimed)).toThrow(
+      EvidenceIntegrityError,
+    );
+  },
+);

@@ -1,59 +1,82 @@
-import { z } from "zod";
-
 import {
-  AnalysisInputError,
-  AnalysisProtocolError,
-} from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+  resolveEvidenceRequest,
+  type EvidenceLookup,
+} from "../EvidenceInputResolver.js";
+import type { ExecutionOptions } from "../AnalysisProvider.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
+import { ok, type Result } from "../../domain/result.js";
 import {
-  managedNativeVerificationInputSchema,
-  verifyManagedNativeBoundaries,
-  type ManagedNativeVerificationInput,
-  type ManagedNativeVerificationResult,
+  managedNativeVerificationHasUnknowns,
+  verifyManagedNativeVerificationSource,
 } from "../../domain/managed/managedNativeVerification.js";
-import { err, ok, type Result } from "../../domain/result.js";
-import { MANAGED_WORKFLOW_PROVIDER } from "../InvestigationProviders.js";
+import {
+  readManagedNativeVerificationSource,
+  type ManagedNativeVerificationSource,
+} from "../../domain/managed/managedNativeVerificationSource.js";
+import {
+  managedNativeVerificationRequestSchema,
+  type ManagedNativeVerificationResult,
+} from "../../domain/managed/managedNativeVerificationSchemas.js";
+import { MANAGED_WORKFLOW_PROVIDER } from "../../domain/investigationProviders.js";
 
 const OPERATION = "verify_managed_native_boundaries" as const;
 
-/** Verify managed/native boundary declarations against native Evidence. */
-export const verifyManagedNativeBoundariesEvidence = (
+export interface ManagedNativeVerificationExecution {
+  readonly evidence: Evidence;
+  readonly summary: ManagedNativeVerificationResult["summary"];
+  readonly sourceEvidence: readonly Evidence[];
+  readonly hasUnknowns: boolean;
+}
+
+/** Resolve untrusted source Evidence, then execute over the trusted parsed source. */
+export const executeManagedNativeBoundaries = (
   rawInput: unknown,
-): Result<Evidence, AnalysisError> => {
-  const parsed = managedNativeVerificationInputSchema.safeParse(rawInput);
-  if (!parsed.success)
-    return err(new AnalysisInputError(OPERATION, { cause: parsed.error }));
-  try {
-    const result = verifyManagedNativeBoundaries(parsed.data);
-    return ok(createManagedNativeVerificationEvidence(parsed.data, result));
-  } catch (cause: unknown) {
-    return err(
-      cause instanceof TypeError || cause instanceof z.ZodError
-        ? new AnalysisInputError(OPERATION, { cause })
-        : new AnalysisProtocolError(
-            "Managed/native verification produced an invalid result",
-            { cause },
-          ),
-    );
-  }
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<ManagedNativeVerificationExecution, AnalysisError> => {
+  const request = resolveEvidenceRequest(
+    OPERATION,
+    rawInput,
+    managedNativeVerificationRequestSchema,
+    lookup,
+    options,
+  );
+  if (!request.ok) return request;
+  const source = readManagedNativeVerificationSource(request.value.input);
+  if (!source.ok) return source;
+  const result = verifyManagedNativeVerificationSource(source.value);
+  const evidence = createManagedNativeVerificationEvidence(
+    source.value,
+    result,
+  );
+  return ok({
+    evidence,
+    summary: result.summary,
+    hasUnknowns: managedNativeVerificationHasUnknowns(result),
+    sourceEvidence: [
+      source.value.managedEvidence,
+      ...source.value.nativeObservations.map(
+        ({ evidence: observation }) => observation,
+      ),
+    ],
+  });
 };
 
 const createManagedNativeVerificationEvidence = (
-  input: ManagedNativeVerificationInput,
+  source: ManagedNativeVerificationSource,
   result: ManagedNativeVerificationResult,
 ): Evidence =>
   createEvidence(undefined, MANAGED_WORKFLOW_PROVIDER, {
     predicateType: "rea.managed-native-verification",
     operation: OPERATION,
     parameters: {
-      managed_boundaries_evidence_id: input.managed_boundaries.evidence_id,
-      native_evidence_ids: jsonValueSchema.parse(
-        input.native_observations.map(({ evidence_id: id }) => id),
+      managed_boundaries_evidence_id: source.managedEvidence.evidence_id,
+      native_evidence_ids: source.nativeObservations.map(
+        ({ evidence }) => evidence.evidence_id,
       ),
     },
-    result: jsonValueSchema.parse(result),
+    result,
     rawResult: null,
     confidence: "inferred",
     authority: "analyst-inference",

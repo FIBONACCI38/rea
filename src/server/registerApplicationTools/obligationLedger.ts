@@ -1,44 +1,63 @@
-import { recordSessionEvidenceSources } from "../sessionEvidence.js";
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "../EvidenceMcpServer.js";
+import { runAdmittedToolOperation } from "../admittedToolOperation.js";
+import { recordEvidenceSources } from "../../application/investigation/recordEvidenceSources.js";
 
-import {
-  buildReconstructionObligationLedgerEvidenceValidated,
-  resolveReconstructionObligationLedgerRequest,
-} from "../../application/ReconstructionObligationLedgerService.js";
-import { applicationToolContract } from "../../contracts/applicationToolContracts.js";
+import { buildResolvedReconstructionObligationLedgerEvidence } from "../../application/ReconstructionObligationLedgerService.js";
+import { resolveReconstructionObligationLedgerRequest } from "../../application/ReconstructionObligationLedgerRequest.js";
+import { ok } from "../../domain/result.js";
+import { toolContract } from "../../contracts/toolContracts.js";
 import { logToolExecution } from "../toolLogging.js";
 import { toolRegistrationOptions } from "../toolRegistrationOptions.js";
-import { toCallToolResult } from "../toolResult.js";
 import { recordResult } from "./helpers.js";
 import type { ApplicationToolRegistration } from "./types.js";
 
-const contract = applicationToolContract(
-  "build_reconstruction_obligation_ledger",
-);
+const contract = toolContract("build_reconstruction_obligation_ledger");
 
 /** Register conservative reconstruction-obligation generation and closure. */
 export const registerReconstructionObligationLedgerTool = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   options: ApplicationToolRegistration,
 ): void => {
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    async (input) => {
-      const resolved = resolveReconstructionObligationLedgerRequest(input);
-      if (!resolved.ok) return toCallToolResult(resolved, contract);
-      const result = await logToolExecution(options.logger, contract.name, () =>
-        Promise.resolve(
-          buildReconstructionObligationLedgerEvidenceValidated(resolved.value),
-        ),
-      );
-      if (!result.ok) return toCallToolResult(result, contract);
-      const recorded = recordSessionEvidenceSources(
-        options.recordEvidence,
-        resolved.value.evidence_bundle.records,
-      );
-      if (!recorded.ok) return toCallToolResult(recorded, contract);
-      return recordResult(options, contract, result.value);
-    },
+    async (input, context) =>
+      runAdmittedToolOperation(
+        server,
+        options.withAdmittedAnalysis,
+        contract.name,
+        context.mcpReq.signal,
+        async () => {
+          const resolved = resolveReconstructionObligationLedgerRequest(input);
+          if (!resolved.ok)
+            return server.delivery.toCallToolResult(resolved, contract);
+          const result = await logToolExecution(
+            options.logger,
+            contract.name,
+            () =>
+              Promise.resolve(
+                ok(
+                  buildResolvedReconstructionObligationLedgerEvidence(
+                    resolved.value,
+                  ),
+                ),
+              ),
+          );
+          if (!result.ok)
+            return server.delivery.toCallToolResult(result, contract);
+          const recorded = recordEvidenceSources(
+            options.recordEvidence,
+            resolved.value.sources.bundle.records,
+            { evidence: result.value },
+          );
+          if (!recorded.ok)
+            return server.delivery.toCallToolResult(recorded, contract);
+          return recordResult(
+            { ...options, delivery: server.delivery },
+            contract,
+            result.value,
+          );
+        },
+      ),
   );
 };

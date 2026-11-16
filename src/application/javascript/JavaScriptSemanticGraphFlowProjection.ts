@@ -1,21 +1,24 @@
-import { createJavaScriptSemanticGraphUnknown } from "../../domain/javascript/javascriptSemanticGraph.js";
-import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraph.js";
-import type { JavaScriptSemanticIr } from "../../domain/javascript/javascriptSemanticIr.js";
+import { javascriptSourceRangeKey } from "../../domain/javascript/javascriptSourceCoordinates.js";
+import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
+import { javaScriptSemanticNodeId } from "../../domain/javascript/javascriptSemanticGraph.js";
+import type {
+  JavaScriptSemanticIr,
+  JavaScriptSemanticProjectedResultBinding,
+} from "../../domain/javascript/javascriptSemanticIr.js";
 import { sourceRangesEqual } from "../../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type { JavaScriptSourceRange } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
 import {
-  addSemanticGraphNode,
+  retainSemanticGraphNode,
   addSemanticGraphRelation,
   addSemanticGraphUnknown,
-  constructSemanticGraphNode,
   type SemanticGraphProjectionState,
 } from "./JavaScriptSemanticGraphConstruction.js";
 import {
   inferredSemanticEvidenceAt,
   unknownSemanticEvidence,
 } from "./JavaScriptSemanticGraphEvidence.js";
-import { semanticNodesWithinRange } from "./JavaScriptSemanticGraphProjection.js";
 
 /** File-local graph state needed by return, capture, and frontier projection. */
 export interface SemanticFlowProjectionContext {
@@ -27,20 +30,41 @@ export interface SemanticFlowProjectionContext {
   readonly callableNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>;
   readonly callSiteNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>;
   readonly returnSiteNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>;
+  readonly readNodes: JavaScriptSemanticGraphNode[];
+  readonly writeNodes: JavaScriptSemanticGraphNode[];
   readonly referenceNodes: readonly JavaScriptSemanticGraphNode[];
+  readonly referenceNodesWithin: (
+    range: JavaScriptSourceRange,
+  ) => JavaScriptSemanticGraphNode[];
+  readonly callSiteAt: (
+    range: JavaScriptSourceRange,
+  ) => JavaScriptSemanticGraphNode | undefined;
 }
 
-/** Find the retained call-site node at one exact semantic source range. */
-export const semanticCallSiteAt = (
-  context: SemanticFlowProjectionContext,
-  location: JavaScriptSourceRange,
-): JavaScriptSemanticGraphNode | undefined => {
-  const call = context.ir.callSites.find(({ location: candidate }) =>
-    sourceRangesEqual(candidate, location),
-  );
-  return call === undefined
-    ? undefined
-    : context.callSiteNodes.get(call.callSiteId);
+/** Project result destructuring consistently for timers, child processes, and requests. */
+export const projectSemanticResultBindings = (
+  context: Pick<SemanticFlowProjectionContext, "state" | "bindingNodes">,
+  source: JavaScriptSemanticGraphNode | undefined,
+  bindings: readonly JavaScriptSemanticProjectedResultBinding[],
+  candidateEvidence?: ApplicationGraphEvidence,
+): void => {
+  for (const projected of bindings)
+    addSemanticGraphRelation(context.state, {
+      source,
+      target: context.bindingNodes.get(projected.bindingId),
+      relation: "destructures",
+      resolution:
+        candidateEvidence === undefined && projected.resolution === "complete"
+          ? "resolved"
+          : "candidate",
+      ...(candidateEvidence === undefined
+        ? {}
+        : { evidence: candidateEvidence }),
+      properties: {
+        projection_path: [...projected.projectionPath],
+        projection_resolution: projected.resolution,
+      },
+    });
 };
 
 /** Project explicit static Promise/task ownership without runtime claims. */
@@ -53,26 +77,19 @@ export const projectSemanticPromises = (
         operation.ownerCallableId === null
           ? undefined
           : context.callableNodes.get(operation.ownerCallableId);
-      const node = addSemanticGraphNode(
-        context.state,
-        constructSemanticGraphNode(
-          context.file,
-          {
-            kind: operation.kind === "awaited-expression" ? "task" : "promise",
-            roleKey: operation.promiseId,
-            location: operation.location,
-            label: promiseLabel(operation),
-            functionNodeId: owner?.node_id ?? null,
-            properties: {
-              method: operation.method,
-              operation_kind: operation.kind,
-              ownership: operation.ownership,
-              source_resolution: operation.sourceResolution,
-            },
-          },
-          context.state,
-        ),
-      );
+      const node = retainSemanticGraphNode(context.state, context.file, {
+        kind: operation.kind === "awaited-expression" ? "task" : "promise",
+        roleKey: operation.promiseId,
+        location: operation.location,
+        label: promiseLabel(operation),
+        functionNodeId: owner?.node_id ?? null,
+        properties: {
+          method: operation.method,
+          operation_kind: operation.kind,
+          ownership: operation.ownership,
+          source_resolution: operation.sourceResolution,
+        },
+      });
       return node === null ? [] : [[operation.promiseId, node] as const];
     }),
   );
@@ -104,7 +121,7 @@ const projectPromiseCreation = (
 ): void => {
   if (operation.kind === "awaited-expression") return;
   addSemanticGraphRelation(context.state, {
-    source: semanticCallSiteAt(context, operation.location),
+    source: context.callSiteAt(operation.location),
     target: promise,
     relation: "creates-promise",
     resolution:
@@ -193,34 +210,90 @@ const addPromiseUnknown = (
   promiseNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>,
 ): void => {
   const relation = operation.kind === "aggregate" ? "aggregates" : "chains";
-  addSemanticGraphUnknown(
-    context.state,
-    createJavaScriptSemanticGraphUnknown({
-      node_id: promise.node_id,
-      family: "promise-ownership",
-      relation_kinds: [relation],
-      reason: "ambiguous-target",
-      detail: `Static ${operation.method} source resolution was ${operation.sourceResolution}.`,
-      candidate_node_ids: operation.sourcePromiseIds.flatMap((identifier) => {
-        const candidate = promiseNodes.get(identifier);
-        return candidate === undefined ? [] : [candidate.node_id];
-      }),
-      evidence: unknownSemanticEvidence(context.file, operation.location),
+  addSemanticGraphUnknown(context.state, {
+    node_id: promise.node_id,
+    family: "promise-ownership",
+    relation_kinds: [relation],
+    reason: "ambiguous-target",
+    detail: `Static ${operation.method} source resolution was ${operation.sourceResolution}.`,
+    candidate_node_ids: operation.sourcePromiseIds.flatMap((identifier) => {
+      const candidate = promiseNodes.get(identifier);
+      return candidate === undefined ? [] : [candidate.node_id];
     }),
-  );
+    evidence: unknownSemanticEvidence(context.file, operation.location),
+  });
 };
+
+interface ObjectReadIndex {
+  readonly state: SemanticGraphProjectionState;
+  readonly nodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>;
+}
+
+const objectReadIndexes = new WeakMap<JavaScriptSemanticIr, ObjectReadIndex>();
+
+/**
+ * The object projection owns a member read's occurrence. Index it once per
+ * file so return and argument flow can connect that expression without
+ * scanning every property read again.
+ */
+const objectReadOccurrences = (
+  context: SemanticFlowProjectionContext,
+): ReadonlyMap<string, JavaScriptSemanticGraphNode> => {
+  const cached = objectReadIndexes.get(context.ir);
+  if (cached !== undefined && cached.state === context.state)
+    return cached.nodes;
+  const nodes = new Map<string, JavaScriptSemanticGraphNode>();
+  for (const operation of context.ir.objectOperations) {
+    if (operation.kind !== "read") continue;
+    const node = context.state.nodes.get(
+      javaScriptSemanticNodeId({
+        kind: "expression",
+        identity: {
+          artifact_sha256: context.file.sha256,
+          module_path: context.file.path,
+          source_range: operation.location,
+          role_key: operation.objectOperationId,
+        },
+      }),
+    );
+    if (node !== undefined)
+      nodes.set(javascriptSourceRangeKey(operation.location), node);
+  }
+  objectReadIndexes.set(context.ir, { state: context.state, nodes });
+  return nodes;
+};
+
+/** Return the retained read occurrence for one unwrapped member expression. */
+export const semanticObjectReadOccurrence = (
+  context: SemanticFlowProjectionContext,
+  location: JavaScriptSourceRange | null,
+): JavaScriptSemanticGraphNode | undefined =>
+  location === null
+    ? undefined
+    : objectReadOccurrences(context).get(javascriptSourceRangeKey(location));
 
 /** Link direct return expressions to their retained semantic references. */
 export const projectSemanticReturnValues = (
   context: SemanticFlowProjectionContext,
 ): void => {
+  const expressions = new Set(
+    context.ir.expressionFlows.map((flow) =>
+      javascriptSourceRangeKey(flow.location),
+    ),
+  );
   for (const callable of context.ir.callables)
     for (const site of callable.returnSites) {
       const returnNode = context.returnSiteNodes.get(site.returnSiteId);
-      const references = semanticNodesWithinRange(
-        context.referenceNodes,
-        site.location,
-      );
+      const references =
+        site.valueExpressionLocation !== null &&
+        expressions.has(javascriptSourceRangeKey(site.valueExpressionLocation))
+          ? []
+          : context
+              .referenceNodesWithin(site.location)
+              .filter(
+                (reference) =>
+                  reference.function_node_id === returnNode?.function_node_id,
+              );
       for (const reference of references)
         addSemanticGraphRelation(context.state, {
           source: reference,
@@ -235,6 +308,15 @@ export const projectSemanticReturnValues = (
               ? "resolved"
               : "candidate",
         });
+      addSemanticGraphRelation(context.state, {
+        source: semanticObjectReadOccurrence(
+          context,
+          site.valueExpressionLocation,
+        ),
+        target: returnNode,
+        relation: "aliases",
+        resolution: "resolved",
+      });
     }
 };
 
@@ -256,10 +338,11 @@ export const projectSemanticClosureCaptures = (
 };
 
 /** Retain bounded unresolved dynamic-call, dynamic-property and dynamic-scope frontiers. */
-export const projectSemanticFrontiers = (
+export function* projectSemanticFrontiers(
   context: SemanticFlowProjectionContext,
-): void => {
-  for (const frontier of context.ir.frontiers) {
+): Generator<void, void> {
+  for (const [index, frontier] of context.ir.frontiers.entries()) {
+    if (index % 64 === 0) yield;
     // Dynamic environments leave identifier reads and writes unresolved.
     const family =
       frontier.kind === "dynamic-call"
@@ -273,7 +356,7 @@ export const projectSemanticFrontiers = (
         : frontier.kind === "dynamic-scope"
           ? (["reads", "writes"] as const)
           : (["reads-property", "writes-property"] as const);
-    const unknown = createJavaScriptSemanticGraphUnknown({
+    addSemanticGraphUnknown(context.state, {
       node_id:
         frontier.callableId === null
           ? context.moduleNode.node_id
@@ -286,6 +369,5 @@ export const projectSemanticFrontiers = (
       candidate_node_ids: [],
       evidence: unknownSemanticEvidence(context.file, frontier.location),
     });
-    addSemanticGraphUnknown(context.state, unknown);
   }
-};
+}

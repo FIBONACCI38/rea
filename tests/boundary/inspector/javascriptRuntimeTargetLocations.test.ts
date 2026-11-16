@@ -1,23 +1,15 @@
-import { rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { afterEach, expect, test } from "vitest";
+import { expect, test } from "vitest";
 
 import { V8InspectorProvider } from "../../../src/inspector/V8InspectorProvider.js";
 import { startFakeV8Inspector } from "../../fixtures/inspector/fakeV8Inspector.js";
-import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
-
-const roots: string[] = [];
-afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  );
-});
+import { createNodeDiscoveryTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 async function entryFile(name: string): Promise<string> {
-  const root = await createTestTempDirectory("rea-node-discovery-");
-  roots.push(root);
+  const root = await createNodeDiscoveryTempDirectory("rea-node-discovery-");
   const entry = join(root, name);
   await writeFile(entry, "setInterval(() => {}, 1000);\n");
   return entry;
@@ -35,8 +27,7 @@ test("lists and observes a Windows target without inventing a decoded path", asy
     const listed = await provider.listTargets({
       inspector_endpoint: fake.endpoint,
     });
-    expect(listed.ok).toBe(true);
-    if (!listed.ok) return;
+    if (!listed.ok) throw listed.error;
     expect(listed.value.targets).toMatchObject([
       {
         target_id: fake.targetId,
@@ -66,8 +57,7 @@ test("lists and observes a Windows target without inventing a decoded path", asy
       target_id: fake.targetId,
       observation_ms: 10,
     });
-    expect(observed.ok).toBe(true);
-    if (!observed.ok) return;
+    if (!observed.ok) throw observed.error;
     expect(observed.value.target.location).toEqual(
       listed.value.targets[0]?.location,
     );
@@ -97,8 +87,7 @@ test
       const listed = await new V8InspectorProvider().listTargets({
         inspector_endpoint: fake.endpoint,
       });
-      expect(listed.ok).toBe(true);
-      if (!listed.ok) return;
+      if (!listed.ok) throw listed.error;
       expect(listed.value.targets).toMatchObject([
         { location: { kind: "file", file_path: entry } },
       ]);
@@ -116,8 +105,7 @@ test("keeps a lossy discovery name unresolved even when its underscore alias exi
     const listed = await new V8InspectorProvider().listTargets({
       inspector_endpoint: fake.endpoint,
     });
-    expect(listed.ok).toBe(true);
-    if (!listed.ok) return;
+    if (!listed.ok) throw listed.error;
     expect(listed.value.targets).toMatchObject([
       { location: { kind: "unresolved", reported_url: reported } },
     ]);
@@ -137,8 +125,7 @@ test.each([
     const listed = await new V8InspectorProvider().listTargets({
       inspector_endpoint: fake.endpoint,
     });
-    expect(listed.ok).toBe(true);
-    if (!listed.ok) return;
+    if (!listed.ok) throw listed.error;
     expect(listed.value.targets).toEqual([]);
     expect(listed.value.excluded.unsupported_location).toBe(1);
   } finally {
@@ -158,8 +145,7 @@ test.each([
     const listed = await new V8InspectorProvider().listTargets({
       inspector_endpoint: fake.endpoint,
     });
-    expect(listed.ok).toBe(true);
-    if (!listed.ok) return;
+    if (!listed.ok) throw listed.error;
     expect(listed.value.targets).toEqual([]);
     expect(listed.value.excluded.unsupported_location).toBe(1);
   } finally {
@@ -183,8 +169,7 @@ test("does not reinterpret lossy discovery paths in script metadata", async () =
       target_id: fake.targetId,
       observation_ms: 10,
     });
-    expect(observed.ok).toBe(true);
-    if (!observed.ok) return;
+    if (!observed.ok) throw observed.error;
     expect(observed.value.scripts.items).toMatchObject([
       { location: { kind: "file", file_path: entry } },
     ]);

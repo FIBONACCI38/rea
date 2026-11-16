@@ -1,30 +1,61 @@
-import * as t from "@babel/types";
-
+import {
+  JAVASCRIPT_SEMANTIC_PRECISION_DEFAULTS,
+  type JavaScriptSemanticPrecision,
+} from "./javascriptSemanticPrecision.js";
 import type {
   JavaScriptSemanticPrimitive,
   JavaScriptSemanticValue,
-} from "./javascriptSemanticIr.js";
-import { compareCodePoints } from "../canonicalOrdering.js";
+} from "./javascriptSemanticValueTypes.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import { semanticPrimitiveKey } from "./javascriptSemanticProvenance.js";
+import {
+  exceedsSemanticPrimitiveStringByteBudget,
+  semanticResourceLimitUnknown,
+} from "./javascriptSemanticResourceLimits.js";
 
 /** Normalize one bounded collection of possible primitive values. */
 export const semanticPrimitiveSet = (
   values: readonly JavaScriptSemanticPrimitive[],
+  precision: JavaScriptSemanticPrecision = JAVASCRIPT_SEMANTIC_PRECISION_DEFAULTS,
 ): JavaScriptSemanticValue => {
+  let uniqueValues: Set<JavaScriptSemanticPrimitive> | undefined;
+  for (const value of values) {
+    if (typeof value === "number" && !Number.isFinite(value))
+      return {
+        status: "unknown",
+        reason: "Nonfinite numbers are outside the JSON primitive lattice.",
+      };
+    if (typeof value === "number" && Object.is(value, -0))
+      return {
+        status: "unknown",
+        reason: "Negative zero cannot be preserved by JSON primitive evidence.",
+      };
+    // The common literal path needs validation, but no deduplication, sorting
+    // or canonical-key allocation. Check strings before retaining the value.
+    if (values.length === 1)
+      return typeof value === "string" &&
+        exceedsSemanticPrimitiveStringByteBudget([value], precision)
+        ? semanticResourceLimitUnknown("primitive-bytes", precision)
+        : { status: "literal", value };
+    uniqueValues ??= new Set<JavaScriptSemanticPrimitive>();
+    uniqueValues.add(value);
+    if (uniqueValues.size > precision.primitive_candidates)
+      return semanticResourceLimitUnknown("primitive-candidates", precision);
+  }
+  if (uniqueValues === undefined) return { status: "union", values: [] };
   if (
-    values.some((value) => typeof value === "number" && !Number.isFinite(value))
+    exceedsSemanticPrimitiveStringByteBudget(
+      [...uniqueValues].flatMap((value) =>
+        typeof value === "string" ? [value] : [],
+      ),
+      precision,
+    )
   )
-    return {
-      status: "unknown",
-      reason: "Nonfinite numbers are outside the JSON primitive lattice.",
-    };
-  const unique = [
-    ...new Map(
-      values.map((value) => [semanticPrimitiveKey(value), value]),
-    ).values(),
-  ].sort((left, right) =>
-    compareCodePoints(semanticPrimitiveKey(left), semanticPrimitiveKey(right)),
-  );
+    return semanticResourceLimitUnknown("primitive-bytes", precision);
+  const unique = [...uniqueValues]
+    .map((value) => ({ key: semanticPrimitiveKey(value), value }))
+    .sort((left, right) => compareUnicodeCodePoints(left.key, right.key))
+    .map(({ value }) => value);
   const only = unique[0];
   return unique.length === 1 && only !== undefined
     ? { status: "literal", value: only }
@@ -40,17 +71,3 @@ export const semanticPrimitiveCandidates = (
     : value.status === "union"
       ? value.values
       : null;
-
-/** Parse one Babel primitive literal without evaluating code. */
-export const semanticPrimitiveValue = (
-  node: t.Node,
-):
-  | { readonly found: true; readonly value: JavaScriptSemanticPrimitive }
-  | { readonly found: false } => {
-  if (t.isStringLiteral(node)) return { found: true, value: node.value };
-  if (t.isNumericLiteral(node) && Number.isFinite(node.value))
-    return { found: true, value: node.value };
-  if (t.isBooleanLiteral(node)) return { found: true, value: node.value };
-  if (t.isNullLiteral(node)) return { found: true, value: null };
-  return { found: false };
-};

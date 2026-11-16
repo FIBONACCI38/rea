@@ -1,36 +1,34 @@
-import { reconstructionCoverageEvaluationInputSchema } from "../domain/reconstructionCoverageInput.js";
-import { AnalysisInputError } from "../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
-import { evaluateReconstructionClosure } from "../domain/reconstructionCoverage.js";
-import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
-import { err, ok, type Result } from "../domain/result.js";
+import { parseAnalysisInput } from "./AnalysisInput.js";
+
+import { reconstructionCoverageRequestSchema } from "../domain/reconstructionCoverageInput.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import {
+  evaluateParsedReconstructionClosure,
+  readReconstructionCoverageData,
+  type ReconstructionClosureResult,
+} from "../domain/reconstructionCoverage.js";
+import type { Result } from "../domain/result.js";
+
+const OPERATION = "evaluate_reconstruction_coverage";
 
 /** Evaluate inline reconstruction coverage against a named boundary. */
 export const evaluateReconstructionCoverage = (
   rawInput: unknown,
   nowEpochMs = Date.now(),
-): Result<JsonValue, AnalysisError> => {
-  const parsed =
-    reconstructionCoverageEvaluationInputSchema.safeParse(rawInput);
-  if (!parsed.success)
-    return err(
-      new AnalysisInputError("evaluate_reconstruction_coverage", {
-        cause: parsed.error,
-      }),
-    );
-  try {
-    return ok(
-      jsonValueSchema.parse(
-        evaluateReconstructionClosure(
-          parsed.data.coverage,
-          parsed.data.boundary_id,
-          nowEpochMs,
-        ),
-      ),
-    );
-  } catch (cause: unknown) {
-    return err(
-      new AnalysisInputError("evaluate_reconstruction_coverage", { cause }),
-    );
-  }
+): Result<ReconstructionClosureResult, AnalysisError> => {
+  const parsed = parseAnalysisInput(
+    OPERATION,
+    rawInput,
+    reconstructionCoverageRequestSchema,
+  );
+  if (!parsed.ok) return parsed;
+  const coverage = readReconstructionCoverageData(parsed.value.coverage, [
+    "coverage",
+  ]);
+  if (!coverage.ok) return coverage;
+  return evaluateParsedReconstructionClosure(
+    coverage.value,
+    parsed.value.boundary_id,
+    nowEpochMs,
+  );
 };

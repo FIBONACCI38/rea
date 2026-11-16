@@ -4,17 +4,21 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
+import { createInspectionResources } from "../../../fixtures/inspectionResources.js";
 
-import type { BinaryTarget } from "../../../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 import {
   hopperLoaderArgsForTarget,
   resolveHopperAnalysisProfile,
 } from "../../../../src/hopper/HopperAnalysisProfile.js";
-import { HOPPER_PROVIDER_IDENTITY } from "../../../../src/hopper/HopperProvider.js";
+import { HOPPER_PROVIDER_IDENTITY } from "../../../../src/hopper/HopperProviderMetadata.js";
 
+let inspectionResources = createInspectionResources();
 let directory: string | undefined;
 
 afterEach(async () => {
+  await inspectionResources.close();
+  inspectionResources = createInspectionResources();
   if (directory !== undefined)
     await rm(directory, { recursive: true, force: true });
   directory = undefined;
@@ -31,30 +35,30 @@ describe("Hopper analysis profiles", () => {
     });
   });
 
-  it.each([
-    [target("mach-o", "arm64"), ["-l", "Mach-O", "--aarch64"]],
-    [target("elf", "x86_64"), ["-l", "ELF", "--intel-64"]],
-    [target("pe", "x86"), ["-l", "WinPE", "--intel-32"]],
-    [
-      {
-        path: "/tmp/fixture",
+  it("does not map caller-supplied raw binaries onto a Hopper loader", () => {
+    expect(
+      hopperLoaderArgsForTarget({
+        path: "/tmp/ecu.bin",
         sha256: "a".repeat(64),
         kind: "executable",
-        format: "mach-o",
-        architecture: "arm64",
-        availableArchitectures: ["x86_64", "arm64"] as const,
-      } satisfies BinaryTarget,
-      ["-l", "FAT", "--aarch64", "-l", "Mach-O"],
-    ],
-    [
-      {
-        path: "/tmp/fixture.hop",
-        sha256: "b".repeat(64),
-        kind: "database",
-        format: "analysis-database",
-      } satisfies BinaryTarget,
-      [],
-    ],
+        format: "raw-binary",
+        architecture: "arm",
+        availableArchitectures: ["arm"],
+        entryPoint: "0x8000000",
+        entryPointSource: "0x8000000",
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "ProviderAdapterError",
+        operation: "resolve_analysis_profile",
+      },
+    });
+  });
+
+  it.each([
+    [target("elf", "x86_64"), ["-l", "ELF", "--intel-64"]],
+    [target("pe", "x86"), ["-l", "WinPE", "--intel-32"]],
   ] as const)("derives complete non-interactive options", (input, expected) => {
     expect(hopperLoaderArgsForTarget(input)).toEqual({
       ok: true,
@@ -63,73 +67,68 @@ describe("Hopper analysis profiles", () => {
     expect("loaderArgs" in input).toBe(false);
   });
 
-  it("commits launcher build and configured overrides without target coupling", async () => {
-    directory = await createTestTempDirectory("rea-hopper-profile-");
-    const launcher = join(directory, "hopper");
-    await writeFile(launcher, "Hopper build A");
-    const input = target("mach-o", "arm64");
-    const derived = await resolveHopperAnalysisProfile(input, {
-      launcherPath: launcher,
-      loaderArgsOverride: [],
-      provider: HOPPER_PROVIDER_IDENTITY,
-    });
-    const overridden = await resolveHopperAnalysisProfile(input, {
-      launcherPath: launcher,
-      loaderArgsOverride: ["-l", "Mach-O", "--intel-64"],
-      provider: HOPPER_PROVIDER_IDENTITY,
-    });
-    if (
-      !derived.ok ||
-      derived.value.profile === null ||
-      !overridden.ok ||
-      overridden.value.profile === null
-    )
-      throw new Error("fixture profiles did not resolve");
-    expect(derived.value.compatibility).toEqual({
-      loaderArgs: ["-l", "Mach-O", "--aarch64"],
-    });
-    expect(overridden.value.compatibility).toEqual({
-      loaderArgs: ["-l", "Mach-O", "--intel-64"],
-    });
-    expect(overridden.value.profile.digest).not.toBe(
-      derived.value.profile.digest,
-    );
-    expect(derived.value.profile.provider.version).toMatch(
-      /^launcher-sha256:[a-f0-9]{64}$/u,
-    );
-
-    await writeFile(launcher, "Hopper build B");
-    const changedBuild = await resolveHopperAnalysisProfile(input, {
-      launcherPath: launcher,
-      loaderArgsOverride: [],
-      provider: HOPPER_PROVIDER_IDENTITY,
-    });
-    if (!changedBuild.ok || changedBuild.value.profile === null)
-      throw new Error("changed fixture profile did not resolve");
-    expect(changedBuild.value.profile.provider.version).not.toBe(
-      derived.value.profile.provider.version,
-    );
-  });
-
-  it("keeps compatibility output but declines cache identity when version is unresolved", async () => {
+  it("refuses a profile when the selected launcher cannot be fingerprinted", async () => {
     const resolved = await resolveHopperAnalysisProfile(
       target("elf", "x86_64"),
       {
         launcherPath: "/missing/hopper",
         loaderArgsOverride: [],
         provider: HOPPER_PROVIDER_IDENTITY,
+        resourceScope: inspectionResources.owner,
       },
     );
-    expect(resolved).toEqual({
-      ok: true,
-      value: {
-        profile: null,
-        compatibility: {
-          loaderArgs: ["-l", "ELF", "--intel-64"],
+    expect(resolved).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "ProviderAdapterError",
+        operation: "resolve_analysis_profile",
+        diagnostics: {
+          launcher_path: "/missing/hopper",
+          system_code: "ENOENT",
         },
       },
     });
   });
+
+  it.each([
+    { override: [], source: "derived", arguments: ["-l", "ELF", "--intel-64"] },
+    {
+      override: ["-l", "Custom Loader", "--intel-64"],
+      source: "configured_override",
+      arguments: ["-l", "Custom Loader", "--intel-64"],
+    },
+  ])(
+    "commits effective loader arguments from $source in the profile",
+    async (scenario) => {
+      directory = await createTestTempDirectory("rea-hopper-profile-loader-");
+      const launcherPath = join(directory, "hopper");
+      await writeFile(launcherPath, "Hopper build");
+      const resolved = await resolveHopperAnalysisProfile(
+        target("elf", "x86_64"),
+        {
+          launcherPath,
+          loaderArgsOverride: scenario.override,
+          provider: HOPPER_PROVIDER_IDENTITY,
+          resourceScope: inspectionResources.owner,
+        },
+      );
+      expect(resolved).toMatchObject({
+        ok: true,
+        value: {
+          profile: {
+            parameters: {
+              function_dossier_coverage:
+                "observed-facets-and-call-relationships-v1",
+              loader: {
+                source: scenario.source,
+                arguments: scenario.arguments,
+              },
+            },
+          },
+        },
+      });
+    },
+  );
 
   it("stops launcher hashing when profile resolution is cancelled", async () => {
     directory = await createTestTempDirectory("rea-hopper-profile-cancel-");
@@ -140,6 +139,7 @@ describe("Hopper analysis profiles", () => {
       launcherPath: launcher,
       loaderArgsOverride: [],
       provider: HOPPER_PROVIDER_IDENTITY,
+      resourceScope: inspectionResources.owner,
       signal: controller.signal,
     });
 

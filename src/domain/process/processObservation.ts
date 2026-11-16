@@ -1,7 +1,17 @@
 import { z } from "zod";
 
 import { jsonValueSchema, type JsonValue } from "../jsonValue.js";
-import type { UnverifiedProcessCapture } from "./processCapture.js";
+import type {
+  TerminalFrame,
+  UnverifiedProcessCapture,
+} from "./processCapture.js";
+
+/** Project normalized PTY facts without source text used only for audit. */
+export const comparableTerminalFrame = (frame: TerminalFrame) => ({
+  sequence: frame.sequence,
+  at_ms: frame.at_ms,
+  data: frame.data,
+});
 
 /** Process-capture observation families shared by live drivers and trace assertions. */
 export const processObservationSourceSchema = z.enum([
@@ -26,8 +36,8 @@ export const processObservationLocationSchema = z.strictObject({
     "process_samples",
     "filesystem_checkpoints",
   ]),
-  index: z.number().int().nonnegative(),
-  capture_order: z.number().int().nonnegative(),
+  index: z.int().nonnegative(),
+  capture_order: z.int().nonnegative(),
 });
 export type ProcessObservationLocation = z.infer<
   typeof processObservationLocationSchema
@@ -126,11 +136,14 @@ const projectedRecord = (
 ): ProjectedRecord | null => {
   const projected = (() => {
     switch (location.collection) {
-      case "frames":
+      case "frames": {
+        const frame = capture.frames[location.index];
         return {
           source: "terminal_raw" as const,
-          value: capture.frames[location.index],
+          value:
+            frame === undefined ? undefined : comparableTerminalFrame(frame),
         };
+      }
       case "rendered_frames":
         return {
           source: "terminal_rendered" as const,

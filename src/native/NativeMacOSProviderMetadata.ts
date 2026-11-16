@@ -1,16 +1,27 @@
-import type {
-  CapabilityDescriptor,
-  ProviderIdentity,
-} from "../application/AnalysisProvider.js";
+import { NATIVE_MACOS_PROVIDER_IDENTITY } from "./NativeMacosProviderIdentity.js";
+import type { CapabilityDescriptor } from "../application/AnalysisProvider.js";
+import { createAnalysisProfile } from "../domain/analysisProfile.js";
 import { NATIVE_TOOL_CONTRACTS } from "../contracts/native/nativeToolContracts.js";
+import { APPLE_DISPATCH_TARGET_APPLICABILITY } from "../domain/native/objcSwiftMetadata.js";
 
-/** Public identity committed by macOS-native inspection observations. */
-export const NATIVE_MACOS_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
-  id: "native-macos",
-  name: "macOS native inspection utilities",
-  version: null,
-});
-const IDENTITY = NATIVE_MACOS_PROVIDER_IDENTITY;
+/** Source-owned commitment for the pure Apple dispatch metadata reader. */
+export const APPLE_DISPATCH_METADATA_ANALYSIS_PROFILE = createAnalysisProfile(
+  {
+    id: NATIVE_MACOS_PROVIDER_IDENTITY.id,
+    name: NATIVE_MACOS_PROVIDER_IDENTITY.name,
+    version: "apple-metadata-reader-4",
+  },
+  {
+    operation: "inspect_native_dispatch_metadata",
+    reader: "apple-dispatch-metadata",
+    revision: 4,
+  },
+);
+/** Operations whose target process can show UI, use the network and write files. */
+const OWNED_PROCESS_OPERATIONS: ReadonlySet<string> = new Set([
+  "capture_native_ui_scenario",
+  "observe_native_calls",
+]);
 
 /** Declare native host coverage without creating a command runner. */
 export const nativeMacOSCapabilities = (
@@ -30,17 +41,25 @@ export const nativeMacOSCapabilities = (
             reason: "Native macOS utilities require macOS.",
           } as const);
       return Object.freeze({
-        provider: IDENTITY,
+        provider: NATIVE_MACOS_PROVIDER_IDENTITY,
         operation: contract.name,
+        ...(contract.name === "inspect_native_dispatch_metadata"
+          ? {
+              analysisProfile: APPLE_DISPATCH_METADATA_ANALYSIS_PROFILE,
+              targetApplicability: APPLE_DISPATCH_TARGET_APPLICABILITY,
+            }
+          : {}),
         ...availability,
         effects: Object.freeze({
           mutatesArtifact: false,
           launchesProcess: contract.name !== "inspect_native_dispatch_metadata",
-          mayShowUi: contract.name === "capture_native_ui_scenario",
-          mayAccessNetwork: contract.name === "capture_native_ui_scenario",
+          mayShowUi: OWNED_PROCESS_OPERATIONS.has(contract.name),
+          mayAccessNetwork: OWNED_PROCESS_OPERATIONS.has(contract.name),
           mayWriteFilesystem:
-            contract.name === "capture_native_ui_scenario" ||
-            contract.name === "observe_native_ui",
+            OWNED_PROCESS_OPERATIONS.has(contract.name) ||
+            contract.name === "observe_native_ui" ||
+            contract.name === "inspect_signature" ||
+            contract.name === "inspect_macho",
           changesPermissions: false,
           requiresRoot: false,
         }),

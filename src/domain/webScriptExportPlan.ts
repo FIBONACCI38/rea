@@ -4,10 +4,13 @@ import type {
   CapturedWebScript,
   ExportedWebScript,
 } from "./webScriptExport.js";
+import { urlDeclaresQueryOrFragment } from "./urlComponents.js";
 
 const hash = (text: string): string =>
   createHash("sha256").update(text).digest("hex");
-const PORTABLE_SEGMENT = /^[A-Za-z0-9_~.-]+$/u;
+// Literal URL path characters that are also portable filename characters.
+// Percent escapes remain isolated: decoding them could change path identity.
+const PORTABLE_SEGMENT = /^[A-Za-z0-9_~.!$&'()+,;=@-]+$/u;
 const RESERVED_SEGMENT = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 
 /** One planned file, or an explicit missing source with no filesystem effect. */
@@ -15,6 +18,12 @@ export interface PlannedWebScript {
   readonly script: CapturedWebScript;
   readonly record: ExportedWebScript;
 }
+
+/** Stable isolated identity shared by planning and destination collision fallback. */
+export const isolatedWebScriptPath = (
+  source: CapturedWebScript["source"],
+  index: number,
+): string => `isolated/source-${index + 1}-${hash(JSON.stringify(source))}.js`;
 
 /** Preserve safe URL layouts only when every captured path is unambiguous. */
 export const planWebScriptExport = (
@@ -34,7 +43,7 @@ export const planWebScriptExport = (
       };
     const candidate = candidates[index];
     const reason = conflicts.has(index)
-      ? "Captured paths collide by content version, case, or file/directory prefix."
+      ? "Captured paths collide by content version or file/directory prefix."
       : (candidate?.reason ?? null);
     const path = reason === null ? candidate?.path : undefined;
     return {
@@ -44,9 +53,7 @@ export const planWebScriptExport = (
         url: script.url,
         content: {
           state: "exported",
-          relative_path:
-            path ??
-            `isolated/source-${index + 1}-${hash(JSON.stringify(script.source))}.js`,
+          relative_path: path ?? isolatedWebScriptPath(script.source, index),
           layout: path === undefined ? "isolated" : "url-path",
           layout_reason: reason,
           sha256: script.content.sha256,
@@ -94,8 +101,7 @@ const candidatePath = (script: CapturedWebScript): CandidatePath => {
   return {
     path: `origins/${hash(url.origin)}/${parts.join("/")}`,
     reason:
-      url.search !== "" ||
-      url.hash !== "" ||
+      urlDeclaresQueryOrFragment(url) ||
       url.username !== "" ||
       url.password !== ""
         ? "URL query, fragment, or credentials cannot select a canonical local module."
@@ -103,40 +109,27 @@ const candidatePath = (script: CapturedWebScript): CandidatePath => {
   };
 };
 
-// Register every prefix so case collisions in parent directories and a file
-// conflicting with a directory isolate all affected sources, not just the last.
+// Register every exact prefix so a repeated path, or a file that is also a
+// directory prefix, isolates every affected source. Case-distinct spellings
+// stay distinct until the destination filesystem reports a collision.
 const conflictingPaths = (
   candidates: readonly CandidatePath[],
 ): Set<number> => {
-  const prefixes = new Map<
-    string,
-    {
-      spellings: Set<string>;
-      indices: number[];
-      files: number[];
-    }
-  >();
+  const prefixes = new Map<string, { indices: number[]; files: number[] }>();
   candidates.forEach(({ path }, index) => {
     if (path === undefined) return;
     const parts = path.split("/");
     parts.forEach((_, position) => {
       const spelling = parts.slice(0, position + 1).join("/");
-      const key = spelling.toLowerCase();
-      const entry = prefixes.get(key) ?? {
-        spellings: new Set<string>(),
-        indices: [],
-        files: [],
-      };
-      entry.spellings.add(spelling);
+      const entry = prefixes.get(spelling) ?? { indices: [], files: [] };
       entry.indices.push(index);
       if (position === parts.length - 1) entry.files.push(index);
-      prefixes.set(key, entry);
+      prefixes.set(spelling, entry);
     });
   });
   const conflicts = new Set<number>();
   for (const entry of prefixes.values())
     if (
-      entry.spellings.size > 1 ||
       entry.files.length > 1 ||
       (entry.files.length > 0 && entry.indices.length > entry.files.length)
     )

@@ -1,46 +1,56 @@
 import { z } from "zod";
+import { safeParseUtf8Json } from "../../domain/safeJson.js";
+import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import type { AnalysisCapturedOutput } from "../../domain/analysisErrorBase.js";
+import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import {
   normalizeArtifactPath,
   ArtifactPathRegistry,
 } from "../../artifacts/ArtifactPaths.js";
-import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
+import {
+  AnalysisAccessDeniedError,
+  AnalysisArtifactChangedError,
+  AnalysisCancelledError,
+  AnalysisOutputError,
+} from "../../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import type { JavaScriptRecoveryResult } from "../../domain/javascript/javascriptRecovery.js";
-import { readRecoveryFile, recoveryFailureMessage } from "./RecoveryFiles.js";
-import { RECOVERY_LIMITS } from "./WakaruRelease.js";
+import {
+  isRecoveryFileSizeError,
+  readRecoveryFile,
+  recoveryFailureMessage,
+} from "./RecoveryFiles.js";
+import { RECOVERY_LIMITS, wakaruFixedLimitRecovery } from "./WakaruRelease.js";
 import type { runWakaruCommand } from "./WakaruCommand.js";
 
-const warningSchema = z.strictObject({
+const warningSchema = z.looseObject({
   filename: z.string(),
   kind: z.string(),
   is_error: z.boolean(),
   message: z.string(),
 });
-const reportSchema = z.strictObject({
+const reportSchema = z.looseObject({
   detected_formats: z.array(z.string()),
   safety: z.string(),
   modules: z.array(
-    z.strictObject({
+    z.looseObject({
       filename: z.string().min(1),
       kind: z.literal("javascript"),
-      status: z.literal("decompiled"),
+      status: z.string().min(1),
     }),
   ),
   warnings: z.array(warningSchema),
-  total: z.number().int().nonnegative(),
-  failed: z.number().int().nonnegative(),
-  elapsed_ms: z.number().int().nonnegative(),
+  total: z.int().nonnegative(),
+  failed: z.int().nonnegative(),
+  elapsed_ms: z.int().nonnegative(),
 });
-const rangeSchema = z.tuple([
-  z.number().int().nonnegative(),
-  z.number().int().nonnegative(),
-]);
-const provenanceSchema = z.strictObject({
+const rangeSchema = z.tuple([z.int().nonnegative(), z.int().nonnegative()]);
+const provenanceSchema = z.looseObject({
   format: z.string(),
   strategy: z.string(),
   modules: z.record(
     z.string(),
-    z.strictObject({
+    z.looseObject({
       input: z.string(),
       ranges: z.array(rangeSchema),
       extraction: z.string(),
@@ -51,17 +61,33 @@ const provenanceSchema = z.strictObject({
 
 const OPERATION = "recover_javascript_sources";
 
+/** Keep the reader's exact cleanup owner alongside the finished command output. */
+export class WakaruReportReadFailure extends Error {
+  constructor(
+    readonly failure: ArtifactReaderFailure,
+    readonly capturedOutput: AnalysisCapturedOutput,
+  ) {
+    super(failure.message, { cause: failure });
+  }
+}
+
 type ReportContext = {
   execution: Awaited<ReturnType<typeof runWakaruCommand>>;
   provenancePath: string;
-  snapshotPath: string;
-  sourceBytes: Buffer;
+  snapshots: ReadonlyMap<string, Buffer>;
   files: readonly { relativePath: string }[];
+  resources?: ArtifactResourceScope;
+  signal?: AbortSignal;
 };
 
-/** Parse exact pinned producer JSON before projecting provider-neutral artifacts. */
+/**
+ * Parse producer JSON before projecting provider-neutral artifacts. Wakaru adds
+ * fields and category values within a major version, so unknown keys are kept
+ * and `status` stays the reported string; identity, path, range and file-set
+ * checks below remain exact.
+ */
 export const parseWakaruReports = async (context: ReportContext) => {
-  const { execution, provenancePath } = context;
+  const { execution, provenancePath, resources, signal } = context;
 
   try {
     if (execution.exit_code !== 0 && execution.exit_code !== 1)
@@ -69,13 +95,11 @@ export const parseWakaruReports = async (context: ReportContext) => {
         "Wakaru did not complete recovery (expected exit 0 or a reported partial exit 1)",
       );
     const report = reportSchema.parse(JSON.parse(execution.stdout));
-    const provenance = provenanceSchema.parse(
-      JSON.parse(
-        (
-          await readRecoveryFile(provenancePath, RECOVERY_LIMITS.reportBytes)
-        ).toString("utf8"),
-      ),
+    const decoded = safeParseUtf8Json(
+      await readWakaruProvenanceReport(provenancePath, signal, resources),
     );
+    if (!decoded.ok) throw decoded.cause;
+    const provenance = provenanceSchema.parse(decoded.value);
     if (report.total !== report.modules.length || report.failed > report.total)
       throw new TypeError("Reported module totals disagree");
     if (
@@ -98,8 +122,27 @@ export const parseWakaruReports = async (context: ReportContext) => {
           : ("complete" as const),
     };
   } catch (cause: unknown) {
+    const capturedOutput = {
+      stdout: execution.stdout,
+      stderr: execution.stderr,
+      exit_code: execution.exit_code,
+      signal: execution.signal,
+      truncated: false,
+    };
+    if (
+      cause instanceof AnalysisCancelledError ||
+      cause instanceof AnalysisAccessDeniedError ||
+      cause instanceof AnalysisArtifactChangedError
+    )
+      throw cause.retainCapturedOutput(capturedOutput);
+    if (
+      cause instanceof ArtifactReaderFailure &&
+      (cause.cleanup !== undefined || cause.reason === "cancelled")
+    )
+      throw new WakaruReportReadFailure(cause, capturedOutput);
     throw new ProviderAdapterError("wakaru", OPERATION, {
       cause,
+      ...wakaruReportGuidance(cause),
       diagnostics: {
         reason: `Unusable Wakaru recovery report: ${recoveryFailureMessage(cause)}`,
         exit_code: execution.exit_code,
@@ -111,12 +154,56 @@ export const parseWakaruReports = async (context: ReportContext) => {
   }
 };
 
+const PROVENANCE_REPORT_ALLOWANCE = `Wakaru provenance report exceeds the ${String(RECOVERY_LIMITS.reportBytes)}-byte report allowance`;
+
+/** Report-size refusals name the fixed allowance; other read failures stay unchanged. */
+const readWakaruProvenanceReport = async (
+  path: string,
+  signal: AbortSignal | undefined,
+  resources: ArtifactResourceScope | undefined,
+): Promise<Buffer> => {
+  try {
+    return await readRecoveryFile(
+      path,
+      RECOVERY_LIMITS.reportBytes,
+      signal,
+      resources,
+    );
+  } catch (cause: unknown) {
+    if (!isRecoveryFileSizeError(cause, RECOVERY_LIMITS.reportBytes))
+      throw cause;
+    throw new AnalysisOutputError(OPERATION, PROVENANCE_REPORT_ALLOWANCE, {
+      cause,
+      ...wakaruFixedLimitRecovery(PROVENANCE_REPORT_ALLOWANCE),
+    });
+  }
+};
+
+/** Keep fixed-limit guidance when the report parser wraps the producing error. */
+const wakaruReportGuidance = (
+  cause: unknown,
+): { readonly userMessage?: string; readonly remediationAction?: string } => {
+  if (typeof cause !== "object" || cause === null) return {};
+  const userMessage =
+    "userMessage" in cause && typeof cause.userMessage === "string"
+      ? cause.userMessage
+      : undefined;
+  const remediationAction =
+    "remediationAction" in cause && typeof cause.remediationAction === "string"
+      ? cause.remediationAction
+      : undefined;
+  return {
+    ...(userMessage === undefined ? {} : { userMessage }),
+    ...(remediationAction === undefined ? {} : { remediationAction }),
+  };
+};
+
 const validateModuleSet = (
   report: z.output<typeof reportSchema>,
   provenance: z.output<typeof provenanceSchema>,
   context: ReportContext,
 ): void => {
-  const { files, snapshotPath, sourceBytes } = context;
+  const { files, snapshots } = context;
   const registry = new ArtifactPathRegistry();
   const expected = new Set(["provenance.json"]);
   const observed = new Set(files.map((file) => file.relativePath));
@@ -130,7 +217,9 @@ const validateModuleSet = (
     expected.add(path);
     if (observed.has(`${path}.map`)) expected.add(`${path}.map`);
     const entry = provenance.modules[path];
-    if (entry === undefined || entry.input !== snapshotPath)
+    const sourceBytes =
+      entry === undefined ? undefined : snapshots.get(entry.input);
+    if (entry === undefined || sourceBytes === undefined)
       throw new TypeError(
         `Module provenance does not bind the selected input snapshot: ${path}`,
       );
@@ -188,7 +277,9 @@ export const validateRecoverySourceMap = (
     mappings: z.string(),
   });
   try {
-    schema.parse(JSON.parse(bytes.toString("utf8")));
+    const decoded = safeParseUtf8Json(bytes);
+    if (!decoded.ok) throw decoded.cause;
+    schema.parse(decoded.value);
   } catch (cause: unknown) {
     throw new AnalysisOutputError(
       OPERATION,

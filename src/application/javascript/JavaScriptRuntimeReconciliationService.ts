@@ -1,15 +1,21 @@
+import type { ExecutionOptions } from "../AnalysisProvider.js";
 import { resolve } from "node:path";
-import { z } from "zod";
-
+import type { z } from "zod";
 import {
-  AnalysisInputError,
-  AnalysisProtocolError,
-} from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
-import type { Evidence } from "../../domain/evidence.js";
-import { projectInputIssues } from "../../domain/inputIssueProjection.js";
-import { reconcileJavaScriptRuntime } from "../../domain/javascript/javascriptRuntimeReconciliation.js";
-import { reconcileJavaScriptRuntimeInputSchema } from "../../domain/javascript/javascriptRuntimeReconciliationSchemas.js";
+  resolveEvidenceRequest,
+  type EvidenceLookup,
+} from "../EvidenceInputResolver.js";
+import type { EvidenceWorkflowExecution } from "../investigation/EvidenceWorkflowExecution.js";
+import type { EvidenceRequestFrameInput } from "../../domain/evidenceInputContract.js";
+import { reconcileJavaScriptRuntimeRequestSchema } from "../../contracts/javascript/applicationWorkflowInputContracts.js";
+
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
+import {
+  readRuntimeReconciliationInput,
+  reconcileJavaScriptRuntime,
+} from "../../domain/javascript/javascriptRuntimeReconciliation.js";
+import { runtimeReconciliationIdentitiesSchema } from "../../domain/javascript/javascriptRuntimeReconciliationSchemas.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { createJavaScriptRuntimeReconciliationEvidence } from "./JavaScriptRuntimeReconciliationEvidence.js";
 
@@ -18,59 +24,56 @@ const OPERATION = "reconcile_javascript_runtime" as const;
 /** Derive a combined JAG from verified static and passive-runtime Evidence. */
 export const reconcileJavaScriptRuntimeEvidence = (
   rawInput: unknown,
-): Result<Evidence, AnalysisError> => {
-  const parsed = reconcileJavaScriptRuntimeInputSchema.safeParse(rawInput);
-  if (!parsed.success)
+  lookup?: EvidenceLookup,
+  options: Pick<ExecutionOptions, "signal"> = {},
+): Result<EvidenceWorkflowExecution, AnalysisError> => {
+  const selected = resolveEvidenceRequest(
+    OPERATION,
+    rawInput,
+    reconcileJavaScriptRuntimeRequestSchema,
+    lookup,
+    options,
+  );
+  if (!selected.ok) return selected;
+  const parsed = readRuntimeReconciliationInput(
+    normalizeRuntimeMappingRoots(selected.value.input),
+  );
+  if (!parsed.ok) return parsed;
+  const identities = runtimeReconciliationIdentitiesSchema.safeParse({
+    static_layers: parsed.value.layers.map(({ role, evidence }) => ({
+      role,
+      analysis: evidence,
+    })),
+    runtime_observations: parsed.value.captures.map(({ evidence }) => evidence),
+  });
+  if (!identities.success)
     return err(
-      new AnalysisInputError(
+      analysisInputErrorFromIssues(
         OPERATION,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
+        identities.error.issues,
+        rawInput,
       ),
     );
-  return reconcileJavaScriptRuntimeEvidenceValidated(parsed.data);
+  const result = reconcileJavaScriptRuntime(parsed.value);
+  return ok({
+    evidence: createJavaScriptRuntimeReconciliationEvidence(
+      parsed.value.input,
+      result,
+    ),
+    sources: [
+      ...parsed.value.layers.map(({ evidence }) => evidence),
+      ...parsed.value.captures.map(({ evidence }) => evidence),
+    ],
+  });
 };
 
-/** Reconcile input already parsed by a trusted adapter boundary. */
-export const reconcileJavaScriptRuntimeEvidenceValidated = (
-  parsedInput: z.output<typeof reconcileJavaScriptRuntimeInputSchema>,
-): Result<Evidence, AnalysisError> => {
-  try {
-    const input = reconcileJavaScriptRuntimeInputSchema.parse(
-      normalizeRuntimeMappingRoots(parsedInput),
-    );
-    const result = reconcileJavaScriptRuntime(input);
-    return ok(createJavaScriptRuntimeReconciliationEvidence(input, result));
-  } catch (cause: unknown) {
-    if (cause instanceof z.ZodError)
-      return err(
-        new AnalysisInputError(
-          OPERATION,
-          undefined,
-          projectInputIssues(cause.issues, parsedInput),
-        ),
-      );
-    if (
-      cause instanceof TypeError &&
-      SAFE_RECONCILIATION_INPUT_CONSTRAINTS.has(cause.message)
-    )
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          { path: [], reason: "invalid_value", message: cause.message },
-        ]),
-      );
-    return err(
-      new AnalysisProtocolError(
-        "JavaScript runtime reconciliation produced an invalid result",
-        { cause },
-      ),
-    );
-  }
-};
+type RuntimeReconciliationFrame = EvidenceRequestFrameInput<
+  z.output<typeof reconcileJavaScriptRuntimeRequestSchema>
+>;
 
 const normalizeRuntimeMappingRoots = (
-  input: z.output<typeof reconcileJavaScriptRuntimeInputSchema>,
-): z.output<typeof reconcileJavaScriptRuntimeInputSchema> => ({
+  input: RuntimeReconciliationFrame,
+): RuntimeReconciliationFrame => ({
   ...input,
   static_layers: input.static_layers.map((layer) => ({
     ...layer,
@@ -91,24 +94,3 @@ const isPortableAbsolutePath = (path: string): boolean =>
   path.startsWith("/") ||
   /^[a-z]:[\\/]/iu.test(path) ||
   /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(path);
-
-const SAFE_RECONCILIATION_INPUT_CONSTRAINTS = new Set([
-  "Evidence semantic identifier does not match its record",
-  "JavaScript application Evidence subject disagrees with its result",
-  "Runtime reconciliation requires inspect_web_page, inspect_electron_page, observe_javascript_runtime, or capture_electron_scenario Evidence",
-  "Runtime Evidence target or declared role disagrees with its result",
-  "Runtime Evidence contains an invalid builtin location",
-  "Runtime Evidence target disagrees with its captured result",
-  "Browser Evidence target is outside its recorded origin scope",
-  "Runtime Evidence contains source without source-capture selection",
-  "Active Electron Evidence application path disagrees with its configured root",
-  ...[
-    "inspect_web_page",
-    "inspect_electron_page",
-    "observe_javascript_runtime",
-    "capture_electron_scenario",
-  ].map(
-    (operation) =>
-      `Evidence does not match the supported ${operation} contract`,
-  ),
-]);

@@ -1,10 +1,14 @@
 import { Cli, z } from "incur";
 
 import { exportWebScripts } from "../application/WebScriptExportService.js";
+import { exportWebScriptsInputSchema } from "../domain/webScriptExport.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
+import { withCommandCancellation } from "./commandCancellation.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
+import { WEB_SCRIPT_EXPORT_PROVIDER } from "../domain/investigationProviders.js";
 
 /** Register the local captured-script export CLI workflow. */
 export const registerWebScriptCommands = (
@@ -15,27 +19,33 @@ export const registerWebScriptCommands = (
     description:
       "Export retained website scripts into an absent directory for static JavaScript analysis",
     args: z.object({
-      capturePath: z
-        .string()
-        .describe("Absolute path to saved page or scenario capture JSON"),
-      outputDirectory: z
-        .string()
-        .describe(
-          "Absolute absent directory for verified scripts and manifest",
-        ),
+      capturePath: exportWebScriptsInputSchema.shape.capture_path,
+      outputDirectory: exportWebScriptsInputSchema.shape.output_directory,
     }),
     run: ({ args }) =>
-      logCliCommand(logger, CLI_COMMANDS.exportWebScripts, async () => {
-        const result = await exportWebScripts({
-          capture_path: args.capturePath,
-          output_directory: args.outputDirectory,
-        });
-        return result.ok
-          ? result.value
-          : {
-              error: "Script export failed",
-              ...projectAnalysisError(result.error),
-            };
-      }),
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, CLI_COMMANDS.exportWebScripts, async () => {
+          const resources = new ArtifactResourceScope();
+          const result = await finishAnalysisCommand(
+            () =>
+              exportWebScripts(
+                {
+                  capture_path: args.capturePath,
+                  output_directory: args.outputDirectory,
+                },
+                resources,
+                { signal },
+              ),
+            resources,
+            WEB_SCRIPT_EXPORT_PROVIDER.id,
+            "export_web_scripts",
+            signal,
+            "Web script export resources",
+          );
+          return result.ok
+            ? result.value
+            : { error: "Script export failed", ...result.error };
+        }),
+      ),
   });
 };

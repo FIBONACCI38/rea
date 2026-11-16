@@ -1,106 +1,187 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import { SUPPORTED_CLIENT_DEFINITIONS } from "../../src/application/SupportedClients.js";
-import { PRODUCT_IDENTITY } from "../../src/identity.js";
-
-const setupDocumentation = [
-  "docs/installation.md",
-  "README_zh.md",
-  "README_ja.md",
-  "README_ko.md",
-  "README_ar.md",
-] as const;
-
-const normalizedProse = (content: string): string =>
-  content.replace(/\s+/gu, " ").trim();
+import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
+import { processTest } from "../support/process/processFixture.js";
 
 const jsonExamples = (content: string): unknown[] =>
   [...content.matchAll(/```json\s*([\s\S]*?)```/gu)].map((match): unknown =>
     JSON.parse(match[1] ?? ""),
   );
 
+const shellExamples = (content: string): string[] =>
+  [...content.matchAll(/```bash\s*([\s\S]*?)```/gu)].map((match) =>
+    (match[1] ?? "").trim(),
+  );
+
 describe("onboarding documentation product facts", () => {
-  it.each(setupDocumentation)(
-    "keeps requirements and versioned MCP configuration aligned in %s",
-    async (path) => {
+  it.each([
+    [
+      "docs/guides/native/native-investigation.md",
+      "../../providers/raw-binary.md#nmos-6502",
+    ],
+    ["docs/providers/ghidra-riscv.md", "raw-binary.md"],
+  ])(
+    "routes raw admission guidance in %s to the owning guide",
+    async (path, target) => {
       const content = await readFile(resolve(path), "utf8");
-      expect(jsonExamples(content)).toContainEqual(
-        expect.objectContaining({
-          mcpServers: expect.objectContaining({
-            rea: expect.objectContaining({
-              command: "npx",
-              args: [
-                "-y",
-                PRODUCT_IDENTITY.registrationPackageSpecifier,
-                "mcp",
-              ],
-            }),
-          }),
-        }),
+      const links = [...content.matchAll(/\]\(([^)\s]+)\)/gu)].map(
+        (match) => match[1],
       );
-      expect(content).toContain("Node.js 22");
-      expect(content).toContain("macOS 12");
-      expect(content).toContain("Ubuntu 24.04");
-      expect(content).toContain("Fedora 41");
-      expect(content).toContain("Arch Linux");
-      expect(content).toContain("CachyOS");
-      for (const client of SUPPORTED_CLIENT_DEFINITIONS)
-        expect(content).toContain(client.displayName);
-      if (path.startsWith("README_"))
-        expect(content).toContain("MCP-tool_catalog");
+      expect(links, path).toContain(target);
     },
   );
 
-  it("keeps both English CLI onboarding paths discoverable", async () => {
-    const content = await readFile(resolve("README.md"), "utf8");
-    expect(content).toMatch(
-      /\bnpx(?:\s+(?:--yes|-y))?\s+rea-agents(?:@[^\s]+)?\s+setup\b/u,
+  it("documents manual MCP registration with an absolute runtime and entry script", async () => {
+    const content = await readFile(
+      resolve("docs/getting-started/installation.md"),
+      "utf8",
     );
-    expect(content).toMatch(
-      /\bnpm\s+install\s+(?:--global|-g)\s+rea-agents\b/u,
-    );
-    expect(content).toContain("rea setup");
-  });
-
-  it("links to optional installer and unattended setup instructions", async () => {
-    const [readme, installation] = await Promise.all([
-      readFile(resolve("README.md"), "utf8"),
-      readFile(resolve("docs/installation.md"), "utf8"),
-    ]);
-    expect(readme).toMatch(/\]\(docs\/installation\.md(?:#[^)]+)?\)/u);
-    const prose = normalizedProse(installation);
-    expect(prose).toContain(
-      "curl -fsSL https://raw.githubusercontent.com/morluto/rea/main/install.sh | bash",
-    );
-    expect(prose).toMatch(/\brea setup\b[^\n`]*--install-hopper\b/u);
-  });
-
-  it("documents explicit setup freshness and rollback", async () => {
-    const content = await readFile(resolve("docs/installation.md"), "utf8");
-    const prose = normalizedProse(content);
-    expect(prose).toMatch(
-      /\bnpx(?:\s+(?:--yes|-y))?\s+rea-agents@latest\s+setup\b/u,
-    );
-    expect(prose).toMatch(
-      /\bnpm exec (?:--yes|-y) --package=rea-agents@\d+\.\d+\.\d+ -- rea setup\b/u,
-    );
-  });
-
-  it("documents the published MCP Registry installation path", async () => {
-    const content = await readFile(resolve("docs/installation.md"), "utf8");
-    expect(content).toContain("MCP Registry");
-    expect(content).toContain("io.github.morluto/rea");
     expect(jsonExamples(content)).toContainEqual(
       expect.objectContaining({
         mcpServers: expect.objectContaining({
           rea: expect.objectContaining({
-            command: "npx",
-            args: ["-y", PRODUCT_IDENTITY.registrationPackageSpecifier, "mcp"],
+            command: "/absolute/path/to/node",
+            args: ["/absolute/path/to/rea/scripts/rea.mjs", "mcp"],
           }),
         }),
       }),
     );
   });
+
+  it("keeps translated onboarding commands aligned with the English examples", async () => {
+    const inventory = JSON.parse(
+      await readFile(resolve("website/locales/languages.json"), "utf8"),
+    ) as { code: string; readme: string }[];
+    const translatedReadmes = inventory
+      .filter((language) => language.code !== "en")
+      .map((language) => language.readme);
+    expect(translatedReadmes).toContain("docs/readme/README_it.md");
+    expect(translatedReadmes).toContain("docs/readme/README_el.md");
+    const editions = (await readdir(resolve("docs/readme")))
+      .filter((name) => /^README_[A-Za-z0-9-]+\.md$/u.test(name))
+      .map((name) => `docs/readme/${name}`);
+    expect([...translatedReadmes].sort()).toEqual(editions.sort());
+    const english = shellExamples(await readFile(resolve("README.md"), "utf8"));
+    for (const path of translatedReadmes)
+      expect(
+        shellExamples(await readFile(resolve(path), "utf8")),
+        path,
+      ).toEqual(english);
+  });
+
+  it("preserves Persian joiners in links to GitHub-rendered headings", async () => {
+    const persian = await readFile(resolve("docs/readme/README_fa.md"), "utf8");
+    // Confirmed against GitHub's rendered README, which retains U+200C.
+    for (const heading of [
+      "REA چگونه کار می‌کند",
+      "چه چیزهایی را می‌توان تحلیل کرد",
+      "نمونه‌های عملی",
+      "پرسش‌های متداول",
+      "به‌روزرسانی REA",
+    ]) {
+      expect(persian).toContain(`## ${heading}`);
+      expect(persian).toContain(
+        `](#${heading.toLowerCase().replaceAll(" ", "-")})`,
+      );
+    }
+  });
+
+  it("preserves zero-width non-joiners in Malayalam links to GitHub-rendered headings", async () => {
+    const malayalam = await readFile(
+      resolve("docs/readme/README_ml.md"),
+      "utf8",
+    );
+    // Confirmed against GitHub's rendered README, which retains U+200C. The
+    // update heading keeps exactly one joiner between അപ and ഡേറ്റ്; an
+    // editor that drops it from the heading or the fragment must fail here.
+    const zeroWidthNonJoiner = "\u200c";
+    for (const heading of [
+      `REA അപ്${zeroWidthNonJoiner}ഡേറ്റ് ചെയ്യുക`,
+      "എന്തൊക്കെ വിശകലനം ചെയ്യാം",
+      "ഉദാഹരണങ്ങൾ",
+    ]) {
+      expect(malayalam).toContain(`## ${heading}`);
+      expect(malayalam).toContain(
+        `](#${heading.toLowerCase().replaceAll(" ", "-")})`,
+      );
+    }
+  });
+});
+
+describe("published performance evidence", () => {
+  const script = resolve(
+    "tests/support/analysis-efficiency/mcp-integer-report.mjs",
+  );
+  const report = resolve(
+    "docs/verification/analysis-efficiency/mcp-integer-allocation.md",
+  );
+  processTest(
+    "keeps generated report facts aligned with committed receipts",
+    async ({ processes }) => {
+      const result = await processes.run(process.execPath, [script, "--check"]);
+      expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+    },
+  );
+  for (const section of ["normal", "heap"]) {
+    processTest(
+      `rejects stale ${section} measurements without rewriting the report`,
+      async ({ processes }) => {
+        const source = await readFile(report, "utf8");
+        const begin = `<!-- BEGIN:allocation-report:${section} -->`;
+        const end = `<!-- END:allocation-report:${section} -->`;
+        const start = source.indexOf(begin) + begin.length;
+        const finish = source.indexOf(end);
+        const block = source.slice(start, finish);
+        const stale = block.replace(/\d+\.\d{3}/u, (value) =>
+          (Number(value) + 1).toFixed(3),
+        );
+        expect(stale).not.toBe(block);
+        const path = resolve(
+          await createTestTempDirectory("rea-report-stale-"),
+          "report.md",
+        );
+        const content = source.slice(0, start) + stale + source.slice(finish);
+        await writeFile(path, content);
+        const result = await processes.run(process.execPath, [
+          script,
+          "--check",
+          "--markdown",
+          path,
+        ]);
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          `Generated allocation report differs: ${section}`,
+        );
+        expect(await readFile(path, "utf8")).toBe(content);
+      },
+    );
+  }
+  processTest(
+    "refuses missing producer markers before writing",
+    async ({ processes }) => {
+      const source = await readFile(report, "utf8");
+      const content = source.replace(
+        "<!-- BEGIN:allocation-report:normal -->",
+        "",
+      );
+      expect(content).not.toBe(source);
+      const path = resolve(
+        await createTestTempDirectory("rea-report-marker-"),
+        "report.md",
+      );
+      await writeFile(path, content);
+      const result = await processes.run(process.execPath, [
+        script,
+        "--markdown",
+        path,
+      ]);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "Expected one opening report marker: normal",
+      );
+      expect(await readFile(path, "utf8")).toBe(content);
+    },
+  );
 });

@@ -1,3 +1,7 @@
+import {
+  closeVerifierResources,
+  withVerifierCleanup,
+} from "../../lib/verifier-cleanup.mjs";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -38,7 +42,7 @@ const names = [
   ...(process.platform === "win32" ? [] : ['with"quote.cjs']),
 ];
 
-try {
+await withVerifierCleanup(async () => {
   await client.connect(transport);
   for (const name of names) {
     const targetPath =
@@ -54,19 +58,20 @@ try {
         stdio: ["ignore", "ignore", "pipe"],
       },
     );
-    try {
-      await verifyTarget(child, targetPath, name);
-    } finally {
-      await terminate(child);
-    }
+    await withVerifierCleanup(
+      () => verifyTarget(child, targetPath, name),
+      [() => terminate(child)],
+    );
   }
-} finally {
-  try {
-    await client.close();
-  } finally {
+}, [
+  async () => {
+    await closeVerifierResources([
+      () => client.close(),
+      () => transport.close(),
+    ]);
     await rm(root, { recursive: true, force: true });
-  }
-}
+  },
+]);
 
 async function verifyTarget(child, targetPath, name) {
   const socket = new URL(await inspectorUrl(child));
@@ -77,6 +82,8 @@ async function verifyTarget(child, targetPath, name) {
   assert.equal(discovery.length, 1);
   const raw = discovery[0];
   assert.equal(typeof raw.id, "string");
+  const expectedAttached =
+    typeof raw.attached === "boolean" ? raw.attached : null;
   // Independent oracle: the fixture owns the pathname, and Node's discovery
   // serialization loses quotes/backslashes. Never decode underscores into it.
   const unresolved = process.platform === "win32" || /[_"\\]/u.test(targetPath);
@@ -96,6 +103,7 @@ async function verifyTarget(child, targetPath, name) {
   const inventory = listed.normalized_result;
   assert.equal(inventory.targets.length, 1);
   assert.equal(inventory.targets[0].target_id, raw.id);
+  assert.equal(inventory.targets[0].attached, expectedAttached);
   assert.deepEqual(inventory.targets[0].location, expectedLocation);
   assert.equal(inventory.excluded.unsupported_location, 0);
   const mcpList = await runMcp("list_javascript_runtime_targets", {
@@ -122,7 +130,13 @@ async function verifyTarget(child, targetPath, name) {
     observation_ms: 100,
   });
   for (const result of [observed.normalized_result, mcpObservation])
-    verifyObservation(result, raw.id, expectedLocation, targetPath);
+    verifyObservation(
+      result,
+      raw.id,
+      expectedLocation,
+      targetPath,
+      expectedAttached,
+    );
   assert.deepEqual(mcpObservation.target, observed.normalized_result.target);
   process.stdout.write(
     `${JSON.stringify({
@@ -133,6 +147,7 @@ async function verifyTarget(child, targetPath, name) {
       target_id: raw.id,
       discovery_url: raw.url,
       target_location: expectedLocation,
+      attached: inventory.targets[0].attached,
       cli_scripts: observed.normalized_result.scripts.items.length,
       mcp_scripts: mcpObservation.scripts.items.length,
       listed_evidence_id: listed.evidence_id,
@@ -141,9 +156,16 @@ async function verifyTarget(child, targetPath, name) {
   );
 }
 
-function verifyObservation(result, targetId, expectedLocation, targetPath) {
+function verifyObservation(
+  result,
+  targetId,
+  expectedLocation,
+  targetPath,
+  expectedAttached,
+) {
   assert.equal(result.target.target_id, targetId);
   assert.equal(result.target.runtime_kind, "node");
+  assert.equal(result.target.attached, expectedAttached);
   assert.deepEqual(result.target.location, expectedLocation);
   assert.equal(result.capture.truncated, false);
   assert.ok(Array.isArray(result.directly_observed));
@@ -170,20 +192,42 @@ async function runMcp(name, arguments_) {
     true,
     JSON.stringify(response.structuredContent),
   );
-  assert.ok(response.structuredContent?.result);
-  return response.structuredContent.result;
+  assert.ok(response.structuredContent?.normalized_result);
+  return response.structuredContent.normalized_result;
 }
 
 async function inspectorUrl(process_) {
-  let captured = "";
-  for await (const chunk of process_.stderr) {
-    captured += chunk.toString("utf8");
-    const match = /Debugger listening on (ws:\/\/[^\s]+)/u.exec(captured);
-    if (match?.[1] !== undefined) return match[1];
-    if (captured.length > 64 * 1_024)
-      throw new Error("Inspector startup output exceeded its bound");
-  }
-  throw new Error("Node exited before reporting its Inspector URL");
+  return new Promise((resolveUrl, rejectUrl) => {
+    let captured = "";
+    const timer = setTimeout(
+      () =>
+        finish(new Error("Inspector startup exceeded its 10000ms deadline")),
+      10_000,
+    );
+    const finish = (error, url) => {
+      clearTimeout(timer);
+      process_.stderr.off("data", onData);
+      process_.stderr.off("end", onEnd);
+      process_.stderr.off("error", onError);
+      process_.off("error", onError);
+      if (error !== undefined) rejectUrl(error);
+      else resolveUrl(url);
+    };
+    const onData = (chunk) => {
+      captured += chunk.toString("utf8");
+      const match = /Debugger listening on (ws:\/\/[^\s]+)/u.exec(captured);
+      if (match?.[1] !== undefined) finish(undefined, match[1]);
+      else if (captured.length > 64 * 1_024)
+        finish(new Error("Inspector startup output exceeded its bound"));
+    };
+    const onEnd = () =>
+      finish(new Error("Node exited before reporting its Inspector URL"));
+    const onError = (error) => finish(error);
+    process_.stderr.on("data", onData);
+    process_.stderr.once("end", onEnd);
+    process_.stderr.once("error", onError);
+    process_.once("error", onError);
+  });
 }
 
 async function runCli(arguments_) {
@@ -219,7 +263,14 @@ async function terminate(process_) {
     )
       return;
     process_.kill("SIGKILL");
-    await exited;
+    clearTimeout(timer);
+    const killed = await Promise.race([
+      exited.then(() => true),
+      new Promise((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(false), 2_000);
+      }),
+    ]);
+    assert.equal(killed, true, "Inspector fixture did not exit after SIGKILL");
   } finally {
     clearTimeout(timer);
   }

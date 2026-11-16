@@ -1,21 +1,13 @@
-import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
 import { NATIVE_TOOL_CONTRACTS } from "../contracts/native/nativeToolContracts.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
-import type { Logger } from "../logger.js";
 import { registerEvidenceTools } from "./registerEvidenceTools.js";
+import type { EvidenceToolFamilyOptions } from "./retainedSummaryDelivery.js";
 
-/** Register provider-neutral static inspection operations. */
+/** Register macOS native contracts; Mach-O inspection can deliver a retained summary. */
 export const registerNativeTools = (
-  server: McpServer,
-  analysis: AnalysisOperationPort,
-  options: {
-    readonly logger: Logger;
-    readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
-    readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
-  },
+  server: EvidenceMcpServer,
+  options: EvidenceToolFamilyOptions,
 ): void => {
-  registerEvidenceTools(server, analysis, NATIVE_TOOL_CONTRACTS, options);
+  registerEvidenceTools(server, NATIVE_TOOL_CONTRACTS, options);
 };

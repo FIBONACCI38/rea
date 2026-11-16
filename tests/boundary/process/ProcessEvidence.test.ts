@@ -1,25 +1,30 @@
 import { expect, it } from "vitest";
 
-import { createProcessCaptureEvidence } from "../../../src/application/process/ProcessEvidence.js";
+import {
+  createProcessCaptureEvidence,
+  createProcessScenarioPlanEvidence,
+} from "../../../src/application/process/ProcessEvidence.js";
 import {
   createRunManifest,
   observeLaunchedExecutable,
   observeSelectedExecutable,
 } from "../../../src/process/capture/ProcessCaptureLifecycle.js";
-import { emptyUnverifiedProcessCapture } from "../../../src/domain/process/processCapture.fixture.js";
 import {
-  compareProcessCaptures,
-  parseProcessCapture,
-} from "../../../src/domain/process/processCapture.js";
+  accountFullyObservedProcessCapture,
+  emptyUnverifiedProcessCapture,
+} from "../../../src/domain/process/processCapture.fixture.js";
+import { compareProcessCaptures } from "../../../src/domain/process/processComparison.js";
+import { parseProcessCapture } from "../../../src/domain/process/processCaptureParsing.js";
 import {
   digestProcessCommitment,
-  parseProcessScenario,
+  processScenarioPlanSchema,
+  processScenarioSchema,
   processComparisonContract,
   processScenarioCommitment,
 } from "../../../src/domain/process/processScenario.js";
 
 const captureEvidenceForSensitiveInput = (data: string) => {
-  const scenario = parseProcessScenario({
+  const scenario = processScenarioSchema.parse({
     executable: "/bin/echo",
     working_directory: "/tmp",
     events: [{ type: "input", at_ms: 0, data, sensitive: true }],
@@ -59,7 +64,7 @@ const captureEvidenceForSensitiveInput = (data: string) => {
 };
 
 const captureEvidenceForEnvironmentSecret = async (value: string) => {
-  const scenario = parseProcessScenario({
+  const scenario = processScenarioSchema.parse({
     executable: "/bin/echo",
     working_directory: "/tmp",
     environment: { API_TOKEN: value },
@@ -83,18 +88,20 @@ const captureEvidenceForEnvironmentSecret = async (value: string) => {
     ...manifest,
     normalization_sha256: digestProcessCommitment(scenario.normalization),
   };
-  const capture = parseProcessCapture({
-    ...base,
-    normalization: scenario.normalization,
-    frames: [{ sequence: 0, at_ms: 0, data: "observed-output" }],
-    residual_unknowns: [
-      {
-        scope: "environment",
-        reason: "Inherited host environment variables are not recorded.",
-      },
-    ],
-    manifest: scenarioManifest,
-  });
+  const capture = parseProcessCapture(
+    accountFullyObservedProcessCapture({
+      ...base,
+      normalization: scenario.normalization,
+      frames: [{ sequence: 0, at_ms: 0, data: "observed-output" }],
+      residual_unknowns: [
+        {
+          scope: "environment",
+          reason: "Inherited host environment variables are not recorded.",
+        },
+      ],
+      manifest: scenarioManifest,
+    }),
+  );
   return createProcessCaptureEvidence(scenario, capture);
 };
 
@@ -107,6 +114,25 @@ it("does not persist sensitive scripted input in process capture Evidence", () =
   expect(JSON.stringify(manifest)).not.toContain(secret);
   expect(JSON.stringify(evidence.parameters)).not.toContain(secret);
   expect(serialized).not.toContain(secret);
+});
+
+it("does not persist sensitive scripted input in planned Evidence", () => {
+  const secret = "top-secret-planned-input";
+  const scenario = processScenarioSchema.parse({
+    executable: "/bin/echo",
+    working_directory: "/tmp",
+    events: [{ type: "input", at_ms: 0, data: secret, sensitive: true }],
+  });
+  const evidence = createProcessScenarioPlanEvidence(scenario, "darwin");
+
+  expect(JSON.stringify(evidence)).not.toContain(secret);
+  const plan = processScenarioPlanSchema.parse(evidence.normalized_result);
+  expect(plan.scenario.events[0]).toMatchObject({
+    type: "input",
+    data: "",
+    sensitive: true,
+    input_bytes: Buffer.byteLength(secret),
+  });
 });
 
 it("does not treat captures with different redacted inputs as equivalent", () => {
@@ -124,11 +150,9 @@ it("does not treat captures with different redacted inputs as equivalent", () =>
 it("preserves selected local environment and input values", async () => {
   const left = await captureEvidenceForEnvironmentSecret("secret-left");
   const right = await captureEvidenceForEnvironmentSecret("secret-right");
-  const serialized = JSON.stringify(left);
   const leftCapture = parseProcessCapture(left.normalized_result);
   const rightCapture = parseProcessCapture(right.normalized_result);
 
-  expect(serialized).toContain("secret-left");
   expect(leftCapture.manifest.scenario).toMatchObject({
     environment: { API_TOKEN: "secret-left" },
   });
@@ -137,10 +161,12 @@ it("preserves selected local environment and input values", async () => {
     rightCapture.manifest.comparison_contract_sha256,
   );
 
-  const changedOutput = parseProcessCapture({
-    ...leftCapture,
-    frames: [{ sequence: 0, at_ms: 0, data: "different-output" }],
-  });
+  const changedOutput = parseProcessCapture(
+    accountFullyObservedProcessCapture({
+      ...leftCapture,
+      frames: [{ sequence: 0, at_ms: 0, data: "different-output" }],
+    }),
+  );
   expect(compareProcessCaptures(leftCapture, changedOutput)).toMatchObject({
     status: "changed",
     terminal: "changed",

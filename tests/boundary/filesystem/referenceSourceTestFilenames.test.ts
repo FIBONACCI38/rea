@@ -4,8 +4,8 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { importReferenceSource } from "../../../src/application/ReferenceSourceImport.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 it("imports test-suffixed filenames with unchanged paths, hashes, and languages", async () => {
   const root = await createTestTempDirectory("rea-reference-test-filenames-");
@@ -28,8 +28,7 @@ it("imports test-suffixed filenames with unchanged paths, hashes, and languages"
     caller: "reference-test-filenames-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   expect(result.value.entries).toHaveLength(files.length);
   for (const [path, content, classifications, language] of files) {
     expect(result.value.entries).toContainEqual({
@@ -70,8 +69,7 @@ it("keeps parser failures and unknown dependencies visible for test filenames", 
     caller: "reference-test-parsing-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   expect(result.value.inventory_state).toBe("partial");
   expect(result.value.relationships).toEqual([
     {

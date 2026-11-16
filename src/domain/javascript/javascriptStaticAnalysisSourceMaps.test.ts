@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
 
 const sourceMapUrls = (source: string): readonly string[] =>
   analyzeJavaScriptStaticSource(source).source_map_urls.map(
@@ -28,6 +28,83 @@ describe("source map directives", () => {
         "//# sourceMappingURL=first.map\n/*# sourceMappingURL=second.map */",
       ),
     ).toEqual(["first.map", "second.map"]);
+  });
+
+  it("reads a large inline map from a two-byte source without overflowing", () => {
+    const declared =
+      "data:application/json;charset=utf-8;base64," + "A".repeat(9_000_000);
+    const source = `const label = "ğ";\n//# sourceMappingURL=${declared}`;
+
+    expect(sourceMapUrls(source)).toEqual([declared]);
+  });
+
+  it.each([
+    ["after the marker", "//#", "sourceMappingURL=x"],
+    ["before the equals sign", "//# sourceMappingURL", "=x"],
+    ["before the URL", "//# sourceMappingURL=", "x"],
+  ])("reads 9.5M spaces %s without overflowing", (_label, prefix, suffix) => {
+    const source = `ğ${prefix}${" ".repeat(9_500_000)}${suffix}`;
+    expect(analyzeJavaScriptStaticSource(source).source_map_urls).toEqual([
+      {
+        declared_url: "x",
+        location: {
+          start: { line: 1, column: 1 },
+          end: { line: 1, column: source.length },
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    "//#",
+    "//# \t",
+    "//# sourceMappingURL",
+    "//# sourceMappingURL \t",
+    "//# sourceMappingURL=",
+    "//# sourceMappingURL= \t",
+    "/*# sourceMappingURL= */",
+    "//# sourceMappingURLx=app.js.map",
+    "//# sourceMappingURL app.js.map",
+  ])("ignores an incomplete or malformed directive: %s", (source) => {
+    expect(sourceMapUrls(source)).toEqual([]);
+  });
+
+  it("preserves Unicode whitespace and URL terminator boundaries", () => {
+    const source =
+      "ğ/*@\u00a0sourceMappingURL\u2003=\ufeffapp.js.map* ignored */";
+    const declaredEnd = source.indexOf(" ignored");
+    expect(analyzeJavaScriptStaticSource(source).source_map_urls).toEqual([
+      {
+        declared_url: "app.js.map*",
+        location: {
+          start: { line: 1, column: 1 },
+          end: { line: 1, column: declaredEnd },
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    ["/*#", "app*part.js.map", " */"],
+    ["/*@", "*part.js.map", "*/"],
+    ["/*#", "app.js.map*", "*/"],
+    ["/*#", "**part.js.map", " */"],
+    ["/*#", "app.js.map", "*/"],
+    ["//#", "app*part.js.map", ""],
+  ])("preserves the URL and range in %s %s%s", (marker, url, suffix) => {
+    const directive = marker + " sourceMappingURL=" + url;
+    const result = analyzeJavaScriptStaticSource(
+      "export const value = 1;\n" + directive + suffix,
+    );
+    expect(result.source_map_urls).toEqual([
+      {
+        declared_url: url,
+        location: {
+          start: { line: 2, column: 0 },
+          end: { line: 2, column: directive.length },
+        },
+      },
+    ]);
   });
 
   it("reports nothing when no directive is present", () => {

@@ -1,8 +1,13 @@
 import type { JsonValue } from "../../domain/jsonValue.js";
+import { hasNibArchiveSignature } from "../../domain/apple/appleArchiveFormat.js";
+import { isInterfaceBuilderConnectionClass } from "../../domain/apple/interfaceBuilderKeyedArchive.js";
 import { TextDecoder } from "node:util";
+import {
+  InterfaceBuilderDecodeBudget,
+  InterfaceBuilderDecodeBudgetExceeded,
+} from "./InterfaceBuilderDecodeBudget.js";
 
-const MAGIC = Buffer.from("NIBArchive", "ascii");
-const MAX_RECORDS = 1_000_000;
+const DEFAULT_DECODE_BUDGET_BYTES = 128 * 1024 * 1024;
 
 interface NibObjectRecord {
   readonly class_index: number;
@@ -24,15 +29,43 @@ export interface NibArchiveDocument {
   readonly objects: readonly {
     readonly id: number;
     readonly class_name: string;
+    /** Single-valued fields. Repeated serialized keys are disjoint below. */
     readonly values: Readonly<Record<string, JsonValue>>;
+    readonly repeated_values?: Readonly<Record<string, readonly JsonValue[]>>;
   }[];
   readonly classes: readonly string[];
   readonly limitations: readonly string[];
 }
 
+/** Serialized collection members in source order; metadata fields are not members. */
+export const nibCollectionMembers = (
+  object: NibArchiveDocument["objects"][number] | undefined,
+): readonly JsonValue[] | undefined => {
+  if (
+    object === undefined ||
+    !/^(?:NS|NSMutable)(?:Array|Set)$/u.test(
+      object.class_name.replace(/\0+$/u, ""),
+    )
+  )
+    return undefined;
+  const keys = ["UINibEncoderEmptyKey", "NS.objects"];
+  const populated = keys.filter(
+    (key) =>
+      Object.hasOwn(object.values, key) ||
+      Object.hasOwn(object.repeated_values ?? {}, key),
+  );
+  if (populated.length > 1) return undefined;
+  const key = populated[0];
+  if (key === undefined) return [];
+  return object.repeated_values?.[key] ?? [object.values[key]!];
+};
+
 /** Decode Apple's length-prefixed NIBArchive representation without loading UI classes. */
-export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
-  if (bytes.length < 50 || !bytes.subarray(0, MAGIC.length).equals(MAGIC))
+export const decodeNibArchive = (
+  bytes: Buffer,
+  budget = new InterfaceBuilderDecodeBudget(DEFAULT_DECODE_BUDGET_BYTES),
+): NibArchiveDocument => {
+  if (bytes.length < 50 || !hasNibArchiveSignature(bytes))
     throw new TypeError("NIBArchive magic or header is invalid");
 
   const formatVersion = readU32(bytes, 10);
@@ -57,6 +90,19 @@ export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
     valuesOffset,
     classesOffset,
   ]);
+  const projectedFieldCount = preflightProjectedFieldCount(
+    bytes,
+    objectsOffset,
+    keysOffset,
+    objectCount,
+    valueCount,
+    classCount,
+    budget.remainingBytes,
+  );
+  budget.reserve(
+    objectCount * 96 + projectedFieldCount * 96,
+    "NIBArchive object and projected field counts exceed the aggregate Interface Builder decode budget",
+  );
   const objectRecords = parseObjects(
     bytes,
     objectsOffset,
@@ -65,8 +111,21 @@ export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
     valueCount,
     classCount,
   );
-  const keys = parseStrings(bytes, keysOffset, valuesOffset, keyCount, "key");
-  const classes = parseClasses(bytes, classesOffset, bytes.length, classCount);
+  const keys = parseStrings(
+    bytes,
+    keysOffset,
+    valuesOffset,
+    keyCount,
+    "key",
+    budget,
+  );
+  const classes = parseClasses(
+    bytes,
+    classesOffset,
+    bytes.length,
+    classCount,
+    budget,
+  );
   const neededValues = valueIndexes(objectRecords, valueCount);
   const values = parseValues(
     bytes,
@@ -75,6 +134,7 @@ export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
     valueCount,
     keyCount,
     neededValues,
+    budget,
   );
   for (const { value } of values.values()) {
     if (
@@ -92,6 +152,7 @@ export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
     const className = classes[object.class_index];
     if (className === undefined) return [];
     const fields: Record<string, JsonValue> = {};
+    const repeated: Record<string, JsonValue[]> = {};
     for (
       let index = object.value_start;
       index < object.value_start + object.value_count;
@@ -100,15 +161,48 @@ export const decodeNibArchive = (bytes: Buffer): NibArchiveDocument => {
       const value = values.get(index);
       if (value === undefined) continue;
       const key = keys[value.key_index];
-      if (key !== undefined) fields[key] = value.value;
+      if (key === undefined) continue;
+      if (Object.hasOwn(repeated, key)) {
+        budget.reserve(
+          16,
+          "NIBArchive repeated fields exceed the decode budget",
+        );
+        repeated[key]!.push(value.value);
+      } else if (Object.hasOwn(fields, key)) {
+        budget.reserve(
+          96,
+          "NIBArchive repeated fields exceed the decode budget",
+        );
+        Object.defineProperty(repeated, key, {
+          value: [fields[key]!, value.value],
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+        delete fields[key];
+      } else
+        // Archive keys are data, including the legacy __proto__ setter name.
+        Object.defineProperty(fields, key, {
+          value: value.value,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
     }
-    return [{ id, class_name: className, values: fields }];
+    return [
+      {
+        id,
+        class_name: className,
+        values: fields,
+        ...(Object.keys(repeated).length === 0
+          ? {}
+          : { repeated_values: repeated }),
+      },
+    ];
   });
   let connectionObjectCount = 0;
   for (const object of objects)
-    if (
-      /(?:Outlet|Connection|Segue|ActionConnection)/iu.test(object.class_name)
-    )
+    if (isInterfaceBuilderConnectionClass(object.class_name))
       connectionObjectCount += 1;
 
   return {
@@ -158,18 +252,64 @@ const parseObjects = (
   return output;
 };
 
+const preflightProjectedFieldCount = (
+  bytes: Buffer,
+  start: number,
+  end: number,
+  objectCount: number,
+  valueCount: number,
+  classCount: number,
+  maxBytes: number,
+): number => {
+  if (objectCount * 96 > maxBytes)
+    throw new InterfaceBuilderDecodeBudgetExceeded(
+      "aggregate_decode_budget_exhausted",
+      "NIBArchive object count exceeds the aggregate Interface Builder decode budget",
+    );
+  const cursor = { offset: start };
+  let projectedFields = 0;
+  for (let index = 0; index < objectCount; index += 1) {
+    const classIndex = readVarint(bytes, cursor, end);
+    const valueStart = readVarint(bytes, cursor, end);
+    const fieldCount = readVarint(bytes, cursor, end);
+    if (
+      classIndex >= classCount ||
+      valueStart > valueCount ||
+      fieldCount > valueCount - valueStart
+    )
+      throw new TypeError(
+        `NIBArchive object ${index} references an invalid table range`,
+      );
+    projectedFields += fieldCount;
+    if (
+      !Number.isSafeInteger(projectedFields) ||
+      projectedFields * 96 > maxBytes - objectCount * 96
+    )
+      throw new InterfaceBuilderDecodeBudgetExceeded(
+        "aggregate_decode_budget_exhausted",
+        "NIBArchive projected field ranges exceed the aggregate Interface Builder decode budget",
+      );
+  }
+  return projectedFields;
+};
+
 const parseStrings = (
   bytes: Buffer,
   start: number,
   end: number,
   count: number,
   label: string,
+  budget: InterfaceBuilderDecodeBudget,
 ): string[] => {
   const cursor = { offset: start };
   const output: string[] = [];
   for (let index = 0; index < count; index += 1) {
     const length = readVarint(bytes, cursor, end);
     const next = checkedEnd(cursor.offset, length, end, `${label} ${index}`);
+    budget.reserve(
+      32 + length * 2,
+      `NIBArchive ${label} strings exceed the aggregate Interface Builder decode budget`,
+    );
     const value = decodeUtf8(bytes, cursor.offset, next, `${label} ${index}`);
     cursor.offset = next;
     output.push(value);
@@ -182,6 +322,7 @@ const parseClasses = (
   start: number,
   end: number,
   count: number,
+  budget: InterfaceBuilderDecodeBudget,
 ): string[] => {
   const cursor = { offset: start };
   const output: string[] = [];
@@ -200,6 +341,10 @@ const parseClasses = (
     );
     cursor.offset += extraCount * 4;
     const next = checkedEnd(cursor.offset, length, end, `class ${index}`);
+    budget.reserve(
+      32 + length * 2,
+      "NIBArchive class names exceed the aggregate Interface Builder decode budget",
+    );
     const name = decodeUtf8(
       bytes,
       cursor.offset,
@@ -219,6 +364,7 @@ const parseValues = (
   count: number,
   keyCount: number,
   needed: ReadonlySet<number>,
+  budget: InterfaceBuilderDecodeBudget,
 ): Map<number, NibValueRecord> => {
   const cursor = { offset: start };
   const output = new Map<number, NibValueRecord>();
@@ -230,13 +376,39 @@ const parseValues = (
       );
     ensureRange(cursor.offset, 1, end, `value ${index} type`);
     const type = bytes[cursor.offset++] ?? -1;
-    const value = readValue(bytes, cursor, end, type, index);
-    if (needed.has(index)) output.set(index, { key_index: keyIndex, value });
+    if (!needed.has(index)) {
+      skipValue(bytes, cursor, end, type, index);
+      continue;
+    }
+    budget.reserve(
+      64,
+      "NIBArchive decoded values exceed the aggregate Interface Builder decode budget",
+    );
+    const value = readValue(bytes, cursor, end, type, index, budget);
+    output.set(index, { key_index: keyIndex, value });
   }
   if (cursor.offset > end)
     throw new TypeError("NIBArchive value table overlaps the next table");
   return output;
 };
+
+/**
+ * Value type tags in a NIBArchive value table. The two boolean tags carry no
+ * payload; AppKit's own nib decoder reads tag 4 as NO and tag 5 as YES.
+ */
+const NibValueType = {
+  int8: 0,
+  int16: 1,
+  int32: 2,
+  int64: 3,
+  booleanFalse: 4,
+  booleanTrue: 5,
+  float32: 6,
+  float64: 7,
+  data: 8,
+  nil: 9,
+  objectReference: 10,
+} as const;
 
 const readValue = (
   bytes: Buffer,
@@ -244,26 +416,27 @@ const readValue = (
   end: number,
   type: number,
   index: number,
+  budget: InterfaceBuilderDecodeBudget,
 ): JsonValue => {
   switch (type) {
-    case 0:
+    case NibValueType.int8:
       ensureRange(cursor.offset, 1, end, `value ${index}`);
       return bytes.readInt8(cursor.offset++);
-    case 1:
+    case NibValueType.int16:
       ensureRange(cursor.offset, 2, end, `value ${index}`);
       {
         const value = bytes.readInt16LE(cursor.offset);
         cursor.offset += 2;
         return value;
       }
-    case 2:
+    case NibValueType.int32:
       ensureRange(cursor.offset, 4, end, `value ${index}`);
       {
         const value = bytes.readInt32LE(cursor.offset);
         cursor.offset += 4;
         return value;
       }
-    case 3:
+    case NibValueType.int64:
       ensureRange(cursor.offset, 8, end, `value ${index}`);
       {
         const value = bytes.readBigInt64LE(cursor.offset);
@@ -273,25 +446,25 @@ const readValue = (
           ? Number(value)
           : value.toString();
       }
-    case 4:
-      return true;
-    case 5:
+    case NibValueType.booleanFalse:
       return false;
-    case 6:
+    case NibValueType.booleanTrue:
+      return true;
+    case NibValueType.float32:
       ensureRange(cursor.offset, 4, end, `value ${index}`);
       {
         const value = bytes.readFloatLE(cursor.offset);
         cursor.offset += 4;
-        return Number.isFinite(value) ? value : null;
+        return value;
       }
-    case 7:
+    case NibValueType.float64:
       ensureRange(cursor.offset, 8, end, `value ${index}`);
       {
         const value = bytes.readDoubleLE(cursor.offset);
         cursor.offset += 8;
-        return Number.isFinite(value) ? value : null;
+        return value;
       }
-    case 8: {
+    case NibValueType.data: {
       const length = readVarint(bytes, cursor, end);
       const next = checkedEnd(
         cursor.offset,
@@ -299,19 +472,74 @@ const readValue = (
         end,
         `value ${index} data`,
       );
+      budget.reserve(
+        32 + 4 * Math.ceil(length / 3),
+        `NIBArchive data value ${index} exceeds the aggregate Interface Builder decode budget`,
+      );
       const encoded = bytes.subarray(cursor.offset, next).toString("base64");
       cursor.offset = next;
       return { $nib_data_base64: encoded };
     }
-    case 9:
+    case NibValueType.nil:
       return null;
-    case 10:
+    case NibValueType.objectReference:
       ensureRange(cursor.offset, 4, end, `value ${index} reference`);
       {
         const objectIndex = bytes.readUInt32LE(cursor.offset);
         cursor.offset += 4;
         return { $nib_object_ref: objectIndex };
       }
+    default:
+      throw new TypeError(
+        `NIBArchive value ${index} has unsupported type ${type}`,
+      );
+  }
+};
+
+const skipValue = (
+  bytes: Buffer,
+  cursor: { offset: number },
+  end: number,
+  type: number,
+  index: number,
+): void => {
+  switch (type) {
+    case NibValueType.int8:
+      ensureRange(cursor.offset, 1, end, `value ${index}`);
+      cursor.offset += 1;
+      return;
+    case NibValueType.int16:
+      ensureRange(cursor.offset, 2, end, `value ${index}`);
+      cursor.offset += 2;
+      return;
+    case NibValueType.int32:
+    case NibValueType.objectReference:
+      ensureRange(cursor.offset, 4, end, `value ${index}`);
+      cursor.offset += 4;
+      return;
+    case NibValueType.int64:
+    case NibValueType.float64:
+      ensureRange(cursor.offset, 8, end, `value ${index}`);
+      cursor.offset += 8;
+      return;
+    case NibValueType.float32:
+      ensureRange(cursor.offset, 4, end, `value ${index}`);
+      cursor.offset += 4;
+      return;
+    case NibValueType.booleanFalse:
+    case NibValueType.booleanTrue:
+    case NibValueType.nil:
+      return;
+    case NibValueType.data: {
+      const length = readVarint(bytes, cursor, end);
+      cursor.offset = checkedEnd(
+        cursor.offset,
+        length,
+        end,
+        `value ${index} data`,
+      );
+      return;
+    }
     default:
       throw new TypeError(
         `NIBArchive value ${index} has unsupported type ${type}`,
@@ -340,8 +568,8 @@ const valueIndexes = (
 
 const readCount = (bytes: Buffer, offset: number, label: string): number => {
   const count = readU32(bytes, offset);
-  if (count > MAX_RECORDS)
-    throw new TypeError(`NIBArchive ${label} count exceeds the decoder bound`);
+  if (count > bytes.length)
+    throw new TypeError(`NIBArchive ${label} count exceeds the archive length`);
   return count;
 };
 
@@ -369,7 +597,8 @@ const decodeUtf8 = (
   label: string,
 ): string => {
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
+    // These are length-prefixed names, not standalone text documents.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
       bytes.subarray(start, end),
     );
   } catch (cause: unknown) {

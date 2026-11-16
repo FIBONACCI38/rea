@@ -8,7 +8,7 @@ import {
 import { onlyBinding, origin } from "./javascriptSemanticAnalysis.fixture.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { calleeName } from "./javascriptStaticAnalysisHelpers.js";
-import { analyzeParsedJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeParsedJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
 
 const memberChain = ".next".repeat(12_000);
 const ordinaryMemberChain = ".next".repeat(64);
@@ -16,6 +16,7 @@ const ordinaryMemberChain = ".next".repeat(64);
 it("preserves a 12,000-member native import through both analyzers", () => {
   const parsed = parseJavaScriptSource(
     `const value = require("./addon.node")${memberChain}.last; const ordinary = root.next.last;`,
+    "fixture.cjs",
   );
   if (parsed === null) throw new Error("Expected valid JavaScript");
 
@@ -23,7 +24,12 @@ it("preserves a 12,000-member native import through both analyzers", () => {
   const ir = analyzeParsedJavaScriptSemantics(parsed);
   expect(staticAnalysis.parse_status).toBe("complete");
   expect(staticAnalysis.electron.native_addon_bindings).toEqual([
-    expect.objectContaining({ specifier: "./addon.node", members: ["last"] }),
+    expect.objectContaining({
+      specifier: "./addon.node",
+      members: ["next"],
+      namespace_access: false,
+      dynamic_member_access: false,
+    }),
   ]);
   expect(ir.coverage).toEqual({ status: "complete", omittedCount: 0 });
   const path = origin(onlyBinding(ir, "value"));
@@ -34,7 +40,7 @@ it("preserves a 12,000-member native import through both analyzers", () => {
   ]);
 });
 
-it("retains a deep CommonJS re-export path without inventing dynamic module links", () => {
+it("retains deep CommonJS paths and dependencies without inventing dynamic bindings", () => {
   const ir = analyzeJavaScriptSemantics(`
     module.exports.result = require("./dependency.js")${ordinaryMemberChain}.last;
     const dynamic = require("./other.js")${ordinaryMemberChain}[key].last;
@@ -45,6 +51,13 @@ it("retains a deep CommonJS re-export path without inventing dynamic module link
       specifier: "./dependency.js",
       importedName: "last",
       exportedName: "result",
+    }),
+    expect.objectContaining({
+      kind: "require",
+      specifier: "./other.js",
+      importedName: null,
+      localName: null,
+      exportedName: null,
     }),
   ]);
   expect(onlyBinding(ir, "dynamic").provenance).toMatchObject({
@@ -62,10 +75,22 @@ it("invalidates a deep mutation while retaining unrelated literal properties", (
   expect(onlyBinding(ir, "root").value).toEqual({
     status: "object",
     properties: [
-      { name: "untouched", value: { status: "literal", value: "retained" } },
+      {
+        name: "untouched",
+        presence: "present",
+        value: { status: "literal", value: "retained" },
+      },
+      {
+        name: "next",
+        presence: "unknown-coverage",
+        value: {
+          status: "unknown",
+          reason: "This property may have been mutated.",
+        },
+      },
     ],
-    unknownProperties: true,
-    omittedProperties: null,
+    unknownProperties: false,
+    omittedProperties: 0,
   });
   expect(onlyBinding(ir, "value").value).toEqual({
     status: "literal",
@@ -110,11 +135,19 @@ it("keeps a shadowed require local through a deep member initializer", () => {
 
 it.each([
   ["root.first.last()", "root.first.last"],
+  ["root[`first`].last()", "root.first.last"],
+  ['root["first" as const].last()', "root.first.last"],
   ['root[""].last()', "root..last"],
+  ["root[``].last()", "root..last"],
+  ['root["" as const].last()', "root..last"],
   ['("")[""].last()', "last"],
   ['("")[""]()', ""],
   ["root[0].last()", "root.0.last"],
+  ["root[0x1n].last()", "root.1.last"],
+  ["root[-1n].last()", "root.-1.last"],
   ["root[key].last()", "root.[computed@5].last"],
+  ["root[`first${key}`].last()", "root.[computed@5].last"],
+  ["root[`\\unicode`].last()", "root.[computed@5].last"],
   ["root?.first.last()", "root.first.last"],
   [`root${ordinaryMemberChain}.last()`, `root${ordinaryMemberChain}.last`],
 ])("preserves exact callee syntax (case %#)", (source, expected) => {

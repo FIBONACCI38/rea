@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ProviderProcessHandle } from "../../src/process/ProviderProcess.js";
+import { testWaitDeadline } from "../support/testWait.js";
 
 const fixturePath = fileURLToPath(
   new URL("./providerProcess.mjs", import.meta.url),
@@ -8,19 +9,32 @@ const fixturePath = fileURLToPath(
 
 /** Spawn one deterministic process-lifecycle fixture with piped diagnostics. */
 export const spawnProviderProcessFixture = (
-  mode: "burst" | "detached-child" | "exit" | "graceful" | "stubborn",
+  mode:
+    | "burst"
+    | "detached-child"
+    | "exit"
+    | "graceful"
+    | "invalid-utf8"
+    | "valid-multibyte"
+    | "late-stderr"
+    | "stubborn",
   value?: number,
 ): ChildProcess =>
   spawn(
     process.execPath,
     [fixturePath, mode, ...(value === undefined ? [] : [String(value)])],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    {
+      stdio:
+        mode === "late-stderr"
+          ? ["ignore", "pipe", "pipe", "pipe"]
+          : ["ignore", "pipe", "pipe"],
+    },
   );
 
 /** Wait until a long-lived fixture has installed its signal behavior. */
 export const waitForProviderProcessReady = (
   child: ProviderProcessHandle,
-  timeoutMs = 2_000,
+  timeoutMs = testWaitDeadline(),
 ): Promise<void> =>
   new Promise((resolve, reject) => {
     const stdout = child.stdout;
@@ -56,7 +70,7 @@ export const waitForProviderProcessReady = (
 /** Read the distinct process-group leader created by the detached-child mode. */
 export const waitForDetachedProviderChild = (
   child: ProviderProcessHandle,
-  timeoutMs = 2_000,
+  timeoutMs = testWaitDeadline(),
 ): Promise<number> =>
   new Promise((resolve, reject) => {
     const stdout = child.stdout;

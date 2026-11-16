@@ -9,7 +9,9 @@ import { promisify } from "node:util";
 import {
   artifactCli,
   artifactMcpResult,
+  artifactMcpCall,
   withArtifactMcp,
+  withBundleResourcesMcp,
 } from "../../lib/artifact-e2e.mjs";
 
 if (process.platform !== "darwin")
@@ -21,6 +23,7 @@ await exec("/usr/bin/xcrun", ["--find", "actool"]);
 await exec("/usr/bin/xcrun", ["--find", "clang"]);
 await exec("/usr/bin/assetutil", ["--version"]);
 const root = await mkdtemp(join(tmpdir(), "rea-asset-e2e-"));
+let report;
 try {
   const app = join(root, "Fixture.app");
   const resources = join(app, "Contents", "Resources");
@@ -67,6 +70,9 @@ try {
   const sha256 = createHash("sha256")
     .update(await readFile(join(resources, "Assets.car")))
     .digest("hex");
+  const executableSha256 = createHash("sha256")
+    .update(await readFile(join(app, "Contents", "MacOS", "Fixture")))
+    .digest("hex");
   const cli = await artifactCli("inspect-asset-catalog", app);
   assert.deepEqual(
     cli.records.map(({ metadata }) => metadata),
@@ -79,7 +85,7 @@ try {
         asset_name === "FixtureColor" && metadata.AssetType === "Color",
     ),
   );
-  await withArtifactMcp(app, async (client) => {
+  await withBundleResourcesMcp(app, async (client) => {
     assert.deepEqual(
       await artifactMcpResult(client, "inspect_asset_catalog"),
       cli,
@@ -92,15 +98,33 @@ try {
       offset: first.next_offset,
     });
     assert.deepEqual([...first.records, ...next.records], cli.records);
-    const invalid = await client.callTool({
+    const invalid = await artifactMcpCall(client, {
       name: "inspect_asset_catalog",
       arguments: { offset: -1 },
     });
     assert.equal(invalid.isError, true);
   });
-  process.stdout.write(
-    `${JSON.stringify({ ok: true, mocked: false, cli: true, stdio_mcp: true, records: raw.length, pagination: true, malformed_input_rejected: true })}\n`,
-  );
+  const { resource_root, target_sha256, ...resourcePayload } = cli;
+  assert.equal(resource_root.executable_sha256, null);
+  assert.equal(target_sha256, null);
+  await withArtifactMcp(app, async (client) => {
+    const binary = await artifactMcpResult(client, "inspect_asset_catalog");
+    assert.equal(binary.target_sha256, executableSha256);
+    assert.deepEqual(binary, {
+      ...resourcePayload,
+      target_sha256: executableSha256,
+    });
+  });
+  report = {
+    ok: true,
+    mocked: false,
+    cli: true,
+    stdio_mcp: true,
+    records: raw.length,
+    pagination: true,
+    malformed_input_rejected: true,
+  };
 } finally {
   await rm(root, { recursive: true, force: true });
 }
+process.stdout.write(`${JSON.stringify(report)}\n`);

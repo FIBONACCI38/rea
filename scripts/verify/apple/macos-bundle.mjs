@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { createPackageVerifierCommands } from "../../lib/verify-package-commands.mjs";
+import { withVerifierCleanup } from "../../lib/verifier-cleanup.mjs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import {
   artifactCliEvidence,
@@ -14,8 +14,10 @@ import {
   buildMacosBundleFixture,
   preflightMacosBundleFixture,
 } from "../../fixtures/apple/macos-bundle.mjs";
-
-const exec = promisify(execFile);
+import { verifyDyldEnvironment } from "./dyld-environment.mjs";
+import { verifyDylibResolution } from "./macos-dylib-e2e.mjs";
+import { verifyMachOOccurrences } from "./macho-occurrences.mjs";
+import { verifyNativeProvenance } from "./native-provenance.mjs";
 
 await preflightMacosBundleFixture();
 const root = await mkdtemp(join(tmpdir(), "rea-macos-bundle-"));
@@ -63,8 +65,22 @@ const EXPECTED_BUNDLES = [
   ["Contents/XPCServices/Svc.xpc", "xpc-service", "macos-deep", "."],
 ];
 
-try {
-  const { app } = await buildMacosBundleFixture(root);
+const commands = await createPackageVerifierCommands({
+  workspace: {
+    path: root,
+    close: () => rm(root, { recursive: true, force: true }),
+  },
+});
+const exec = (command, args) =>
+  commands.exec(command, args, {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+let report;
+await withVerifierCleanup(async () => {
+  const { app, executable } = await buildMacosBundleFixture(root);
+  const nativeProvenance = await verifyNativeProvenance(app, executable);
+  const machoOccurrences = await verifyMachOOccurrences(app, executable);
   const zip = join(root, "MacFixture.zip");
   await exec("/usr/bin/ditto", ["-c", "-k", "--keepParent", app, zip]);
   const staging = join(root, "dmg-source");
@@ -150,18 +166,21 @@ try {
   assert.deepEqual(anatomies[2], anatomies[0], "DMG anatomy differs");
   const { stdout: attached } = await exec("/usr/bin/hdiutil", ["info"]);
   assert.ok(!attached.includes(dmg), "DMG remained attached after inventory");
+  const dylibs = await verifyDylibResolution(app);
+  const dyldEnvironment = await verifyDyldEnvironment(root);
 
-  process.stdout.write(
-    `${JSON.stringify({
-      ok: true,
-      mocked: false,
-      cli: true,
-      stdio_mcp: true,
-      containers: containers.map(({ format }) => format),
-      bundles: EXPECTED_BUNDLES.length,
-      dmg_detached: true,
-    })}\n`,
-  );
-} finally {
-  await rm(root, { recursive: true, force: true });
-}
+  report = {
+    ok: true,
+    mocked: false,
+    cli: true,
+    stdio_mcp: true,
+    containers: containers.map(({ format }) => format),
+    bundles: EXPECTED_BUNDLES.length,
+    dmg_detached: true,
+    native_provenance: nativeProvenance,
+    macho_occurrences: machoOccurrences,
+    dylib_resolution: dylibs,
+    dyld_environment: dyldEnvironment,
+  };
+}, [() => commands.close()]);
+process.stdout.write(`${JSON.stringify(report)}\n`);

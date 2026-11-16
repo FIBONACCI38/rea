@@ -1,6 +1,10 @@
-import type { ToolContract } from "../toolContracts.js";
+import { z } from "zod";
+import { absoluteLocalPathStringSchema } from "../../domain/localPath.js";
+import type { ToolContract } from "../toolContractTypes.js";
 import { toolContractMetadata } from "../toolEffects.js";
-import { evidenceResultOf } from "../toolOutputSchemas.js";
+import { electronFuseOutputSchemas } from "../toolOutputSchemaGroups.js";
+import { evidenceResultOf } from "../toolOutputSchemaPrimitives.js";
+import { inspectElectronFusesInputSchema } from "../../domain/electron/electronFuses.js";
 import {
   electronPageInspectionSchema,
   electronTargetListSchema,
@@ -12,19 +16,47 @@ import {
   electronActiveObservationResultSchema,
 } from "../../domain/javascript/electronActiveObservation.js";
 import {
+  javaScriptRoutesCompleteDeliveryShape,
+  javaScriptRoutesSummaryDeliveryShape,
+} from "../../domain/analysisView/javascriptRoutesView.js";
+import {
+  javaScriptRoutesViewResultSchema,
+  javascriptApplicationSummaryViewResultSchema,
+} from "../../domain/analysisView/analysisViewResult.js";
+import { analysisDetailOutputSchemaOf } from "../analysisDetail.js";
+import {
   analyzeJavaScriptApplicationInputSchema,
   javascriptApplicationAnalysisResultSchema,
 } from "../../domain/javascript/javascriptApplicationAnalysis.js";
-import {
-  javascriptRuntimeReconciliationResultSchema,
-  reconcileJavaScriptRuntimeInputSchema,
-} from "../../domain/javascript/javascriptRuntimeReconciliationSchemas.js";
+import { javascriptRuntimeReconciliationResultSchema } from "../../domain/javascript/javascriptRuntimeReconciliationSchemas.js";
+import { reconcileJavaScriptRuntimeRequestSchema } from "./applicationWorkflowInputContracts.js";
 import { JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE } from "./javascriptRuntimeReconciliationExample.js";
 
 const listOutputSchema = evidenceResultOf(electronTargetListSchema);
 const inspectionOutputSchema = evidenceResultOf(electronPageInspectionSchema);
-const applicationOutputSchema = evidenceResultOf(
+const javascriptApplicationMcpInputSchema =
+  analyzeJavaScriptApplicationInputSchema.extend({
+    input_path: absoluteLocalPathStringSchema.describe(
+      "Absolute path to the JavaScript application on the machine running REA.",
+    ),
+  });
+/** Caller-selected delivery of a completed JavaScript application analysis. */
+export const analyzeJavaScriptApplicationRequestSchema = z
+  .discriminatedUnion("detail", [
+    javascriptApplicationMcpInputSchema.extend(
+      javaScriptRoutesCompleteDeliveryShape,
+    ),
+    javascriptApplicationMcpInputSchema.extend(
+      javaScriptRoutesSummaryDeliveryShape,
+    ),
+  ])
+  .meta({ "x-rea-root-discriminator": "detail" });
+const applicationOutputSchema = analysisDetailOutputSchemaOf(
   javascriptApplicationAnalysisResultSchema,
+  z.union([
+    javascriptApplicationSummaryViewResultSchema,
+    javaScriptRoutesViewResultSchema,
+  ]),
 );
 const reconciliationOutputSchema = evidenceResultOf(
   javascriptRuntimeReconciliationResultSchema,
@@ -79,9 +111,9 @@ export const ELECTRON_TOOL_CONTRACTS = [
     name: "analyze_javascript_application",
     ...toolContractMetadata("analyze_javascript_application"),
     description:
-      "Reconstruct one local ASAR or extracted JavaScript application as an inline application graph without executing it. Returns all recovered graph nodes, edges, semantic relations, limitations, and coverage.",
+      'Build a static application graph from a local ASAR or extracted JavaScript app without executing it. Supply input_path, e.g. {input_path:"/apps/client",source_paths:["main.js"],detail:"summary"}. Copy source_paths exactly from the inventory, not host-absolute paths inferred from input_path. Returns nodes, edges, semantic relations, integrity contradictions, coverage and unknowns. source_paths limits source analysis to exact inventoried paths without narrowing inventory or artifact identity; dependencies are not implicitly analyzed and unselected sources remain unknown. detail summary reduces delivery, retaining complete Evidence for inspect_analysis_view; it does not reduce analysis. With summary detail, view {kind:"javascript-routes",collection:"routes",offset:0,limit:64} selects static route patterns; static routes do not prove reachability or the complete route set. Integrity mismatches fail by default; record-and-continue retains untrusted observed bytes and partial coverage. analysis_timeout_ms is a per-source provider budget. A host-only timeout needs a longer client deadline, not that budget; do not repeat unchanged work or assume it stopped. If configuration cannot be edited, report the host setting (Codex: mcp_servers.<server>.tool_timeout_sec, seconds).',
     kind: "electron-provider",
-    inputSchema: analyzeJavaScriptApplicationInputSchema,
+    inputSchema: analyzeJavaScriptApplicationRequestSchema,
     outputSchema: applicationOutputSchema,
     examples: [
       {
@@ -89,6 +121,22 @@ export const ELECTRON_TOOL_CONTRACTS = [
         input: {
           input_path: "/Applications/Example.app/Contents/Resources/app.asar",
           format: "auto",
+          integrity_policy: "fail",
+        },
+      },
+      {
+        title: "Analyze selected entry sources before unrelated vendor files",
+        input: {
+          input_path: "/Applications/Example.app/Contents/Resources/app.asar",
+          source_paths: ["package.json", "main.js", "preload.js"],
+          detail: "summary",
+        },
+      },
+      {
+        title: "Retain the complete analysis and return its summary view",
+        input: {
+          input_path: "/Applications/Example.app/Contents/Resources/app.asar",
+          detail: "summary",
         },
       },
     ],
@@ -99,7 +147,7 @@ export const ELECTRON_TOOL_CONTRACTS = [
     description:
       "Reconcile verified static JavaScript application graphs with existing passive web/Electron CDP, passive V8 Inspector, or provider-owned active Electron Evidence. Active Electron captures contribute an explicitly partial target-only runtime record; they never invent renderer scripts, frames, workers, or execution claims. Exact captured-source digests take priority over caller-declared file/URL mappings; target, frame, script, and worker ambiguity remains explicit, and source-map authority stays separate.",
     kind: "electron-provider",
-    inputSchema: reconcileJavaScriptRuntimeInputSchema,
+    inputSchema: reconcileJavaScriptRuntimeRequestSchema,
     outputSchema: reconciliationOutputSchema,
     examples: [
       {
@@ -112,12 +160,28 @@ export const ELECTRON_TOOL_CONTRACTS = [
     name: "capture_electron_scenario",
     ...toolContractMetadata("capture_electron_scenario"),
     description:
-      "Use this for a provider-owned Electron run when passive CDP or Inspector observation cannot exercise application behavior. REA owns startup and teardown, accepts caller-defined click/wait actions plus window-targeted renderer reload/crash and synthetic open-url/second-instance delivery, and returns correlated window/WebContents/process/preload/session/navigation/shell/IPC evidence without retaining payload values. Results identify observed and unavailable event families, coverage status, action targets, and truncation. External shell, navigation, permission, download, popup, updater, and OS-integration effects are blocked and recorded. Use passive Electron tools for observation-only work.",
+      "Launch and exercise an owned Electron app when passive CDP/Inspector observation cannot answer the question. REA owns startup/teardown; selected click/wait, renderer reload/crash and synthetic open-url/second-instance actions change runtime behavior. Returns correlated window/WebContents/process/preload/session/navigation/shell/IPC observations without payload values, plus action targets and coverage/truncation. Actions wait for completion or cancellation; a missing click target can remain pending. External shell, navigation, permission, download, popup, updater and OS-integration effects are blocked and recorded. Cleanup failures retain observations with explicit uncertainty. Use inspect_electron_page or observe_javascript_runtime for passive observation.",
     kind: "electron-provider",
     inputSchema: electronActiveObservationInputSchema,
     outputSchema: evidenceResultOf(electronActiveObservationResultSchema),
     examples: [
       { title: "Exercise an owned Electron application", input: activeExample },
+    ],
+  },
+  {
+    name: "inspect_electron_fuses",
+    ...toolContractMetadata("inspect_electron_fuses"),
+    kind: "artifact-provider",
+    requiresActiveTarget: true,
+    description:
+      "Inspect packaged Electron fuse bytes in one local macOS app bundle, Electron Framework binary, Windows PE executable, or Linux ELF executable. Returns the artifact digest, per-slice wire version, fuse index, version-1 name, state, and raw byte, plus derived implications for Inspector flags, ELECTRON_RUN_AS_NODE, embedded ASAR integrity, and app.asar-only loading. A missing sentinel is unknown fuse state. Reads artifact bytes only and does not modify the selected file or open a runtime target.",
+    inputSchema: inspectElectronFusesInputSchema,
+    outputSchema: electronFuseOutputSchemas.inspect_electron_fuses,
+    examples: [
+      {
+        title: "Read packaged Electron fuse state",
+        input: { path: "/Applications/Example.app" },
+      },
     ],
   },
 ] as const satisfies readonly ToolContract[];

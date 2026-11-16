@@ -1,10 +1,11 @@
-import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import {
-  optionalProviderUnavailable,
-  type OptionalProviderLoadFailure,
-} from "../application/OptionalObservationProviders.js";
-import { err } from "../domain/result.js";
-import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
+  projectRetainedAnalysis,
+  requireAnalysisViewRetention,
+} from "../application/analysisView/AnalysisViewService.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { OptionalProviderLoadFailure } from "../application/OptionalObservationProviders.js";
 
 import type { ElectronActiveObservationPort } from "../application/javascript/ElectronActiveObservationPort.js";
 import { captureElectronScenario } from "../application/javascript/ElectronActiveObservationService.js";
@@ -14,39 +15,45 @@ import {
   listElectronTargets,
 } from "../application/javascript/ElectronObservationService.js";
 import { analyzeJavaScriptApplicationValidated } from "../application/javascript/JavaScriptApplicationService.js";
-import { reconcileJavaScriptRuntimeEvidenceValidated } from "../application/javascript/JavaScriptRuntimeReconciliationService.js";
-import type { ProgressReporter } from "../application/ProgressReporter.js";
-import { toolContract, type ToolContract } from "../contracts/toolContracts.js";
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
-import type { Evidence } from "../domain/evidence.js";
-import type { Result } from "../domain/result.js";
-import { inspectElectronPageInputSchema } from "../domain/javascript/electronObservation.js";
-import type { Logger } from "../logger.js";
-import { mcpProgressReporter } from "./mcpProgress.js";
-import { logToolExecution } from "./toolLogging.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { reconcileJavaScriptRuntimeEvidence } from "../application/javascript/JavaScriptRuntimeReconciliationService.js";
+import { recordEvidenceSources } from "../application/investigation/recordEvidenceSources.js";
+import type { ElectronFuseService } from "../application/electron/ElectronFuseService.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import type { Logger } from "pino";
+import {
+  applicationToolRegistrationOptions,
+  toolRegistrationOptions,
+} from "./toolRegistrationOptions.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import {
+  createEvidenceToolHandler,
+  runEvidenceToolOperation,
+} from "./contractToolHandler.js";
 
 interface ElectronToolRegistration {
+  readonly artifactResources: ArtifactResourceScope;
+  /** The server's selected environment; JavaScript analysis reads its admission settings. */
+  readonly environment: Readonly<Record<string, string | undefined>>;
   readonly logger: Logger;
   readonly observationLoadFailure?: OptionalProviderLoadFailure | undefined;
   readonly activeLoadFailure?: OptionalProviderLoadFailure | undefined;
   readonly electron: ElectronObservationPort | undefined;
   readonly electronActive: ElectronActiveObservationPort | undefined;
+  readonly electronFuses: ElectronFuseService;
   readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
-}
-
-interface ElectronToolContext {
-  readonly signal: AbortSignal;
-  readonly progress: ProgressReporter;
+  readonly evidenceById: EvidenceLookup | undefined;
+  readonly withAdmittedAnalysis?: WithAdmittedAnalysis;
 }
 
 /** Register Electron tools even when a provider is absent. */
 // oxlint-disable-next-line max-lines-per-function -- direct SDK calls retain each schema-handler type correlation.
 export const registerElectronTools = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   options: ElectronToolRegistration,
 ): void => {
+  const registration = { ...options, server };
+  registerElectronFuseTool(server, options);
   const listContract = toolContract("list_electron_targets");
   const inspectContract = toolContract("inspect_electron_page");
   const analyzeContract = toolContract("analyze_javascript_application");
@@ -57,9 +64,10 @@ export const registerElectronTools = (
     listContract.name,
     toolRegistrationOptions(listContract),
     (input, context) =>
-      runElectronTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         listContract,
+        options.observationLoadFailure,
         { input, context },
         (parsed, { signal }) =>
           listElectronTargets(options.electron, parsed, {
@@ -71,50 +79,92 @@ export const registerElectronTools = (
     inspectContract.name,
     toolRegistrationOptions(inspectContract),
     (input, context) =>
-      runElectronTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         inspectContract,
+        options.observationLoadFailure,
         { input, context },
-        async (parsed, { signal, progress }) => {
-          const request = inspectElectronPageInputSchema.parse(parsed);
-          return inspectElectronPage(options.electron, request, {
+        (parsed, { signal, progress }) =>
+          inspectElectronPage(options.electron, parsed, {
             signal,
             progress,
-          });
-        },
+          }),
       ),
   );
   server.registerTool(
     analyzeContract.name,
     toolRegistrationOptions(analyzeContract),
     (input, context) =>
-      runElectronTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         analyzeContract,
+        undefined,
         { input, context },
-        (parsed, { signal, progress }) =>
-          analyzeJavaScriptApplicationValidated(parsed, { signal, progress }),
+        async ({ detail, view, ...request }, { signal, progress }) => {
+          if (detail === "summary") {
+            const ready = requireAnalysisViewRetention(
+              analyzeContract.name,
+              options,
+            );
+            if (!ready.ok) return ready;
+          }
+          const analyzed = await analyzeJavaScriptApplicationValidated(
+            request,
+            options.artifactResources,
+            {
+              signal,
+              progress,
+              environment: options.environment,
+              ...(server.analysisSettings === undefined
+                ? {}
+                : { settings: server.analysisSettings.read }),
+            },
+          );
+          return detail === "summary" && analyzed.ok
+            ? projectRetainedAnalysis(
+                analyzed.value,
+                options,
+                view ?? { kind: "summary" },
+              )
+            : analyzed;
+        },
       ),
   );
   server.registerTool(
     reconcileContract.name,
     toolRegistrationOptions(reconcileContract),
     (input, context) =>
-      runElectronTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         reconcileContract,
+        undefined,
         { input, context },
-        (parsed) =>
-          Promise.resolve(reconcileJavaScriptRuntimeEvidenceValidated(parsed)),
+        async (parsed, { signal }) => {
+          const result = reconcileJavaScriptRuntimeEvidence(
+            parsed,
+            options.evidenceById,
+            { signal },
+          );
+          if (!result.ok) return result;
+          const recorded = recordEvidenceSources(
+            options.recordEvidence,
+            result.value.sources,
+            { evidence: result.value.evidence },
+          );
+          return recorded.ok
+            ? { ok: true, value: result.value.evidence }
+            : recorded;
+        },
       ),
   );
   server.registerTool(
     activeContract.name,
     toolRegistrationOptions(activeContract),
     (input, context) =>
-      runElectronTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         activeContract,
+        options.activeLoadFailure,
         { input, context },
         (parsed, { signal, progress }) =>
           captureElectronScenario(options.electronActive, parsed, {
@@ -125,48 +175,21 @@ export const registerElectronTools = (
   );
 };
 
-const runElectronTool = async <Input>(
+const registerElectronFuseTool = (
+  server: EvidenceMcpServer,
   options: ElectronToolRegistration,
-  contract: ToolContract,
-  request: {
-    readonly input: Input;
-    readonly context: ServerContext;
-  },
-  execute: (
-    input: Input,
-    context: ElectronToolContext,
-  ) => Promise<Result<Evidence, AnalysisError>>,
-) => {
-  const { input, context } = request;
-  const failure =
-    contract.name === "capture_electron_scenario"
-      ? options.activeLoadFailure
-      : contract.name === "list_electron_targets" ||
-          contract.name === "inspect_electron_page"
-        ? options.observationLoadFailure
-        : undefined;
-  if (failure !== undefined)
-    return toCallToolResult(
-      err(optionalProviderUnavailable(failure, contract.name)),
-      contract,
-    );
-  const result = await logToolExecution(options.logger, contract.name, () =>
-    execute(input, {
-      signal: context.mcpReq.signal,
-      progress: mcpProgressReporter(context),
-    }),
+): void => {
+  const contract = toolContract("inspect_electron_fuses");
+  const handler = createEvidenceToolHandler(
+    server,
+    (input, execution) => options.electronFuses.inspect(input, execution),
+    options.logger,
+    options.recordEvidence,
+    options.withAdmittedAnalysis,
   );
-  if (!result.ok) return toCallToolResult(result, contract);
-  return evidenceResult(options, contract, result.value);
-};
-
-const evidenceResult = (
-  options: ElectronToolRegistration,
-  contract: ToolContract,
-  evidence: Evidence,
-) => {
-  const recorded = options.recordEvidence?.(evidence);
-  return recorded !== undefined && !recorded.ok
-    ? toCallToolResult(recorded, contract)
-    : toCallToolResult({ ok: true, value: evidence }, contract);
+  server.registerTool(
+    contract.name,
+    applicationToolRegistrationOptions(contract),
+    handler(contract),
+  );
 };
